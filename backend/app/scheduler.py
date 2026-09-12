@@ -17,7 +17,7 @@ from app.digest import run_scheduled_digest
 from app.docker_client import get_docker_error, get_docker_endpoint, get_docker_status, list_containers
 from app.host_metrics import collect_host_metrics
 from app.networking import build_dns_inventory, discover_and_enrich
-from app.pihole import fetch_pihole_dns
+from app.pihole import PiHoleResult, fetch_pihole_dns
 from app.runtime_settings import (
     apply_watched,
     effective_poll_interval,
@@ -41,6 +41,7 @@ _last_poll_error: str | None = None
 _last_pihole: dict | None = None
 _last_networking: dict | None = None
 _last_dns_records: list | None = None
+_last_caddy_records: list | None = None
 
 
 def get_poll_status() -> dict:
@@ -66,6 +67,21 @@ def get_last_networking() -> dict | None:
     return _last_networking
 
 
+def _networking_public(status: dict | None) -> dict:
+    raw = dict(status or {})
+    raw.pop("route_rows", None)
+    return raw or {
+        "proxy_type": "none",
+        "configured": False,
+        "ok": None,
+        "route_count": 0,
+        "mapped_count": 0,
+        "message": None,
+        "errors": [],
+        "sources_tried": [],
+    }
+
+
 def get_last_dns() -> dict:
     """Snapshot for GET /api/dns — Local DNS rows + Pi-hole / networking status."""
     return {
@@ -78,24 +94,97 @@ def get_last_dns() -> dict:
             "message": "Pi-hole not configured",
             "record_count": 0,
         },
-        "networking": _last_networking
-        or {
-            "proxy_type": "none",
-            "configured": False,
-            "ok": None,
-            "route_count": 0,
-            "mapped_count": 0,
-            "message": None,
-            "errors": [],
-            "sources_tried": [],
-        },
+        "networking": _networking_public(_last_networking),
         "records": list(_last_dns_records or []),
     }
 
 
+def get_last_caddy() -> dict:
+    """Snapshot for GET /api/caddy — discovered Caddy site routes + container join."""
+    return {
+        "taken_at": _last_poll_at,
+        "networking": _networking_public(_last_networking),
+        "records": list(_last_caddy_records or []),
+    }
+
+
+def store_networking_result(status: dict) -> None:
+    global _last_networking, _last_caddy_records
+    rows = status.pop("route_rows", None)
+    _last_caddy_records = list(rows or [])
+    _last_networking = status
+
+
+def _pihole_status_dict(result: PiHoleResult) -> dict:
+    return {
+        "configured": result.configured,
+        "ok": result.ok if result.configured else None,
+        "version": result.version,
+        "message": result.message,
+        "record_count": len(result.records),
+    }
+
+
+def apply_pihole_result(result: PiHoleResult) -> dict:
+    """
+    Push a live Pi-hole fetch into the DNS page snapshot.
+
+    Settings → Test / Save call this so /api/dns matches the Test result
+    immediately (not the previous poll's stale customdns error).
+    """
+    global _last_pihole, _last_dns_records, _last_poll_at
+
+    containers: list = []
+    try:
+        containers = list_containers()
+    except Exception as exc:
+        logger.debug("Pi-hole snapshot: containers unavailable: %s", exc)
+
+    try:
+        net_cfg, _ = resolve_networking()
+        status = discover_and_enrich(
+            containers,
+            proxy_type=net_cfg.proxy_type,
+            use_admin_api=net_cfg.caddy_use_admin_api,
+            admin_url=net_cfg.caddy_admin_url,
+            use_caddyfile=net_cfg.caddy_use_caddyfile,
+            caddyfile_path=net_cfg.caddy_caddyfile_path,
+            use_labels=net_cfg.caddy_use_labels,
+            verify_tls=net_cfg.verify_tls,
+            timeout=net_cfg.timeout_seconds,
+            pihole=result,
+        )
+        store_networking_result(status)
+    except Exception as exc:
+        logger.warning("Pi-hole snapshot: networking join skipped: %s", exc)
+        try:
+            from app.container_enrich import clear_pihole_fields
+
+            clear_pihole_fields(containers)
+        except Exception:
+            pass
+
+    _last_pihole = _pihole_status_dict(result)
+    _last_dns_records = build_dns_inventory(containers, result)
+    _last_poll_at = datetime.now(timezone.utc).isoformat()
+    return get_last_dns()
+
+
+def refresh_pihole_dns_snapshot() -> PiHoleResult:
+    """Re-fetch Pi-hole Local DNS with saved settings and update /api/dns."""
+    cfg, password, token, _src = resolve_pihole()
+    result = fetch_pihole_dns(
+        cfg,
+        password_override=password,
+        token_override=token,
+    )
+    apply_pihole_result(result)
+    return result
+
+
 def poll_once() -> None:
     global _last_poll_at, _last_poll_error, _last_pihole, _last_networking
-    global _last_dns_records
+    global _last_dns_records, _last_caddy_records
     try:
         yaml_cfg = effective_yaml_overlay()
         containers = list_containers()
@@ -138,7 +227,7 @@ def poll_once() -> None:
 
         try:
             net_cfg, _ = resolve_networking()
-            _last_networking = discover_and_enrich(
+            status = discover_and_enrich(
                 containers,
                 proxy_type=net_cfg.proxy_type,
                 use_admin_api=net_cfg.caddy_use_admin_api,
@@ -150,6 +239,7 @@ def poll_once() -> None:
                 timeout=net_cfg.timeout_seconds,
                 pihole=pihole_result,
             )
+            store_networking_result(status)
             # Refresh pihole status record_count / matched after join
             if pihole_result is not None:
                 _last_pihole = {
@@ -172,11 +262,13 @@ def poll_once() -> None:
                 "errors": [str(exc)],
                 "sources_tried": [],
             }
-            # Hostname-only fallback
+            _last_caddy_records = []
+            # No fuzzy hostname fallback — clear badges until a real Caddy join runs
             if pihole_result is not None:
-                from app.container_enrich import correlate_pihole
+                from app.container_enrich import clear_pihole_fields, pihole_status_dict
 
-                _last_pihole = correlate_pihole(containers, pihole_result)
+                clear_pihole_fields(containers)
+                _last_pihole = pihole_status_dict(pihole_result)
             _last_dns_records = build_dns_inventory(containers, pihole_result)
 
         db.save_container_snapshots(containers)

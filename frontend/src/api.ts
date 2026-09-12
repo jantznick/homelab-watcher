@@ -156,6 +156,24 @@ export type DnsInventoryPayload = {
   records: DnsRecordRow[];
 };
 
+export type CaddyRecordRow = {
+  hostname: string;
+  upstream?: string | null;
+  port?: number | null;
+  container?: string | null;
+  container_id?: string | null;
+  container_state?: string | null;
+  source?: string | null;
+  proxy?: string | null;
+  in_dns?: boolean;
+};
+
+export type CaddyInventoryPayload = {
+  taken_at: string | null;
+  networking?: NetworkingStatus | null;
+  records: CaddyRecordRow[];
+};
+
 export type DiskMetric = {
   path: string;
   mountpoint?: string;
@@ -502,6 +520,10 @@ export function fetchContainers() {
 
 export function fetchDns() {
   return getJson<DnsInventoryPayload>("/api/dns");
+}
+
+export function fetchCaddy() {
+  return getJson<CaddyInventoryPayload>("/api/caddy");
 }
 
 export function fetchHost() {

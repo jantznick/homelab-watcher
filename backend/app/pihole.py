@@ -669,7 +669,10 @@ def fetch_pihole_dns(
                     if detected is not None:
                         break
                 if detected is True:
-                    prefer_v5 = prefer_v5 and bool(token)  # still allow v5 fallback
+                    # Confirmed v6 — never fall through to v5 customdns/customcname.
+                    # Leftover v5 API tokens used to overwrite a good v6 result's
+                    # poll cache with "customdns: Connection refused".
+                    prefer_v5 = False
                 elif detected is False:
                     prefer_v6 = False
 
@@ -686,22 +689,27 @@ def fetch_pihole_dns(
                         )
                     if err is None:
                         # Auth + parse succeeded with a genuine empty hosts list.
-                        # In auto mode, still try v5 if a token exists — some labs
-                        # only populated records under the v5 API surface.
-                        if version == "6" or not token or detected is True:
-                            return PiHoleResult(
-                                configured=True,
-                                ok=True,
-                                version="6",
-                                message=(
-                                    "Connected (v6) — 0 Local DNS records in "
-                                    "dns.hosts / cnameRecords (API list is empty)"
-                                ),
-                                records=[],
-                            )
-                        last_err = "Pi-hole v6 returned 0 records; trying v5…"
-                    else:
-                        last_err = err
+                        return PiHoleResult(
+                            configured=True,
+                            ok=True,
+                            version="6",
+                            message=(
+                                "Connected (v6) — 0 Local DNS records in "
+                                "dns.hosts / cnameRecords (API list is empty)"
+                            ),
+                            records=[],
+                        )
+                    last_err = err
+                    # Definitive v6 talk (auth/API errors) — do not mask with v5.
+                    if detected is True or version == "6" or (
+                        err
+                        and (
+                            "v6 auth" in err.lower()
+                            or "v6 session" in err.lower()
+                            or "v6 api" in err.lower()
+                        )
+                    ):
+                        prefer_v5 = False
                     if version == "6":
                         break
 

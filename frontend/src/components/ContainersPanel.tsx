@@ -34,6 +34,11 @@ function isStarred(c: ContainerItem): boolean {
   return Boolean(c.watched ?? c.vital);
 }
 
+/** Same signal as Domains drawer — Caddy join only (never DNS-name fuzzy). */
+function hasDomain(c: ContainerItem): boolean {
+  return (c.networking?.entries || []).length > 0;
+}
+
 function displayHost(url: string): string {
   try {
     const u = new URL(url);
@@ -74,7 +79,14 @@ function securityBadge(c: ContainerItem) {
   );
 }
 
-type Scope = "running" | "all" | "starred" | "updates" | "issues" | "down";
+type Scope =
+  | "running"
+  | "all"
+  | "starred"
+  | "updates"
+  | "issues"
+  | "down"
+  | "nodomain";
 
 const SCOPES: readonly Scope[] = [
   "running",
@@ -83,6 +95,7 @@ const SCOPES: readonly Scope[] = [
   "updates",
   "issues",
   "down",
+  "nodomain",
 ];
 
 function scopeFromSearch(params: URLSearchParams): Scope {
@@ -175,6 +188,7 @@ export function ContainersPanel({
         const sec = c.security;
         if (!sec?.enabled || !sec.issue_count) return false;
       }
+      if (scope === "nodomain" && hasDomain(c)) return false;
       if (!q) return true;
       const hay = [
         c.name,
@@ -294,6 +308,7 @@ export function ContainersPanel({
                 ["starred", "Starred"],
                 ["updates", "Updates"],
                 ["issues", "Issues"],
+                ["nodomain", "No domain"],
               ] as const
             ).map(([id, label]) => (
               <button

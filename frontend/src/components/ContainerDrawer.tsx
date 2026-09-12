@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   fetchContainerLogs,
   fetchJob,
+  saveContainerNotes,
   setWatched,
   startKill,
   startPause,
@@ -123,6 +124,15 @@ export function ContainerDrawer({
   const [logs, setLogs] = useState<string>("");
   const [logsError, setLogsError] = useState<string | null>(null);
   const [logsLoading, setLogsLoading] = useState(false);
+  const [description, setDescription] = useState("");
+  const [notes, setNotes] = useState("");
+  const [notesStatus, setNotesStatus] = useState<
+    "idle" | "dirty" | "saving" | "saved" | "error"
+  >("idle");
+  const [notesError, setNotesError] = useState<string | null>(null);
+  const savedDescription = useRef("");
+  const savedNotes = useRef("");
+  const notesSaveGen = useRef(0);
 
   const loadLogs = useCallback(async (id: string) => {
     setLogsLoading(true);
@@ -156,13 +166,67 @@ export function ContainerDrawer({
       setBusy(false);
       setLogs("");
       setLogsError(null);
+      const desc = container?.description || "";
+      const body = container?.notes || "";
+      setDescription(desc);
+      setNotes(body);
+      savedDescription.current = desc;
+      savedNotes.current = body;
+      setNotesStatus("idle");
+      setNotesError(null);
     }
+    // Sync notes only when opening / switching container — not on inventory refresh.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional
   }, [open, container?.container_id, initialStep]);
 
   useEffect(() => {
     if (!open || !container?.container_id) return;
     void loadLogs(container.container_id);
   }, [open, container?.container_id, loadLogs]);
+
+  const notesDirty =
+    description !== savedDescription.current || notes !== savedNotes.current;
+
+  const saveNotes = useCallback(async () => {
+    if (!container) return;
+    const desc = description;
+    const body = notes;
+    if (desc === savedDescription.current && body === savedNotes.current) {
+      setNotesStatus("idle");
+      return;
+    }
+    const gen = ++notesSaveGen.current;
+    setNotesStatus("saving");
+    setNotesError(null);
+    try {
+      const res = await saveContainerNotes({
+        watched_key: container.watched_key || container.vital_key || undefined,
+        name: container.name,
+        compose_project: container.compose_project,
+        compose_service: container.compose_service,
+        description: desc,
+        notes: body,
+      });
+      if (gen !== notesSaveGen.current) return;
+      if (!res.ok) {
+        setNotesStatus("error");
+        setNotesError(res.error || "Save failed");
+        return;
+      }
+      const nextDesc = res.description ?? desc;
+      const nextNotes = res.notes ?? body;
+      savedDescription.current = nextDesc;
+      savedNotes.current = nextNotes;
+      setDescription((cur) => (cur === desc ? nextDesc : cur));
+      setNotes((cur) => (cur === body ? nextNotes : cur));
+      setNotesStatus("saved");
+      onChanged();
+    } catch (e) {
+      if (gen !== notesSaveGen.current) return;
+      setNotesStatus("error");
+      setNotesError(e instanceof Error ? e.message : String(e));
+    }
+  }, [container, description, notes, onChanged]);
 
   const pollJob = useCallback(
     async (jobId: string) => {
@@ -377,17 +441,74 @@ export function ContainerDrawer({
           </section>
 
           <section className="drawer-section">
+            <div className="drawer-section-head">
+              <h3 className="drawer-section-title">Notes</h3>
+              <div className="drawer-notes-actions">
+                {notesStatus === "saving" ? (
+                  <span className="quiet">Saving…</span>
+                ) : notesStatus === "saved" && !notesDirty ? (
+                  <span className="quiet">Saved</span>
+                ) : notesStatus === "error" ? (
+                  <span className="drawer-notes-error">{notesError || "Save failed"}</span>
+                ) : null}
+                <button
+                  type="button"
+                  className="btn btn-sm"
+                  disabled={notesStatus === "saving" || !notesDirty}
+                  onClick={() => void saveNotes()}
+                >
+                  Save
+                </button>
+              </div>
+            </div>
+            <label className="field">
+              Description
+              <input
+                type="text"
+                value={description}
+                maxLength={200}
+                placeholder="Short label"
+                onChange={(e) => {
+                  setDescription(e.target.value);
+                  setNotesStatus("dirty");
+                }}
+                onBlur={() => {
+                  if (
+                    description !== savedDescription.current ||
+                    notes !== savedNotes.current
+                  ) {
+                    void saveNotes();
+                  }
+                }}
+              />
+            </label>
+            <label className="field">
+              Notes
+              <textarea
+                rows={4}
+                value={notes}
+                placeholder="Optional notes"
+                onChange={(e) => {
+                  setNotes(e.target.value);
+                  setNotesStatus("dirty");
+                }}
+                onBlur={() => {
+                  if (
+                    description !== savedDescription.current ||
+                    notes !== savedNotes.current
+                  ) {
+                    void saveNotes();
+                  }
+                }}
+              />
+            </label>
+          </section>
+
+          <section className="drawer-section">
             <h3 className="drawer-section-title">Domains</h3>
             {(() => {
               const entries = container.networking?.entries || [];
-              const seen = new Set(
-                entries.map((e) => (e.hostname || "").toLowerCase().replace(/\.$/, "")),
-              );
-              const dnsOnly = (container.pihole_hostnames || []).filter((h) => {
-                const n = h.toLowerCase().replace(/\.$/, "");
-                return n && !seen.has(n);
-              });
-              if (!entries.length && !dnsOnly.length) {
+              if (!entries.length) {
                 return <div className="quiet">—</div>;
               }
               return (
@@ -398,20 +519,13 @@ export function ContainerDrawer({
                       <span className="quiet"> → </span>
                       <span className="mono wrap">{e.hostname}</span>
                       {e.in_dns ? (
-                        <span className="badge-dns" title="In Pi-hole Local DNS">
+                        <span
+                          className="badge-dns"
+                          title="Pi-hole DNS target matches a host network IP"
+                        >
                           DNS
                         </span>
                       ) : null}
-                    </li>
-                  ))}
-                  {dnsOnly.map((h) => (
-                    <li key={`dns-${h}`}>
-                      <span className="quiet">—</span>
-                      <span className="quiet"> → </span>
-                      <span className="mono wrap">{h}</span>
-                      <span className="badge-dns" title="In Pi-hole Local DNS">
-                        DNS
-                      </span>
                     </li>
                   ))}
                 </ul>

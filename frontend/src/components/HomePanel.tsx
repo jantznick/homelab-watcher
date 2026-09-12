@@ -115,8 +115,9 @@ function routeForItem(id: string): string {
     case "pihole":
       return "/dns";
     case "networking":
-    case "caddy":
       return "/settings/networking";
+    case "caddy":
+      return "/caddy";
     case "plex":
       return "/settings/plex";
     case "checks":

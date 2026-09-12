@@ -28,6 +28,7 @@ import {
 } from "./api";
 import { ChecksPanel } from "./components/ChecksPanel";
 import { ContainersPanel } from "./components/ContainersPanel";
+import { CaddyPanel } from "./components/CaddyPanel";
 import { DnsPanel } from "./components/DnsPanel";
 import { HomePanel } from "./components/HomePanel";
 import {
@@ -42,7 +43,7 @@ import { SettingsPanel } from "./components/SettingsPanel";
 
 const SIDEBAR_COLLAPSED_KEY = "hlw-sidebar-collapsed";
 
-type NavIcon = "home" | "containers" | "dns" | "host" | "settings";
+type NavIcon = "home" | "containers" | "dns" | "caddy" | "host" | "settings";
 
 type NavItem = { to: string; label: string; icon: NavIcon; end?: boolean };
 
@@ -50,6 +51,7 @@ const PRIMARY_NAV: NavItem[] = [
   { to: "/", label: "Home", icon: "home", end: true },
   { to: "/containers", label: "Containers", icon: "containers" },
   { to: "/dns", label: "DNS", icon: "dns" },
+  { to: "/caddy", label: "Caddy", icon: "caddy" },
 ];
 
 const HOST_NAV: NavItem = { to: "/host", label: "Host", icon: "host" };
@@ -100,6 +102,14 @@ function NavGlyph({ name }: { name: NavIcon }) {
         <svg {...common}>
           <circle cx="12" cy="12" r="8.25" />
           <path d="M3.75 12h16.5M12 3.75c2.4 2.6 3.6 5.4 3.6 8.25S14.4 17.65 12 20.25C9.6 17.65 8.4 14.85 8.4 12S9.6 6.35 12 3.75z" />
+        </svg>
+      );
+    case "caddy":
+      return (
+        <svg {...common}>
+          <path d="M4 7h16M4 12h10M4 17h13" />
+          <circle cx="18.5" cy="12" r="2.25" />
+          <circle cx="19.5" cy="17" r="2.25" />
         </svg>
       );
     case "host":
@@ -578,6 +588,7 @@ export default function App() {
               }
             />
             <Route path="/dns" element={<DnsPanel />} />
+            <Route path="/caddy" element={<CaddyPanel />} />
             <Route
               path="/host/:section?"
               element={

@@ -273,6 +273,72 @@ class TestFetchIntegration(unittest.TestCase):
         self.assertEqual(result.records, [])
         self.assertIn("bare []", result.message or "")
 
+    def test_auto_v6_ignores_leftover_v5_token(self):
+        """v6 host + leftover v5 token must not hit customdns/customcname."""
+        seen_v5 = False
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal seen_v5
+            path = request.url.path
+            if path.endswith("/api/info/version"):
+                return httpx.Response(
+                    200, json={"version": {"ftl": "6.0"}, "took": 0.01}
+                )
+            if path.endswith("/api/auth") and request.method == "POST":
+                return httpx.Response(
+                    200,
+                    json={
+                        "session": {
+                            "valid": True,
+                            "sid": "sid=",
+                            "csrf": "csrf=",
+                        }
+                    },
+                )
+            if path.endswith("/api/auth") and request.method == "DELETE":
+                return httpx.Response(204)
+            if path.endswith("/api/config/dns/hosts"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "config": {
+                            "dns": {
+                                "hosts": ["192.168.1.10 app.lab.local"],
+                            }
+                        }
+                    },
+                )
+            if path.endswith("/api.php") or "customdns" in str(request.url):
+                seen_v5 = True
+                raise ConnectionRefusedError(111, "Connection refused")
+            return httpx.Response(404)
+
+        transport = _transport(handler)
+        real_client = httpx.Client
+
+        def client_factory(*args, **kwargs):
+            kwargs["transport"] = transport
+            kwargs.pop("verify", None)
+            return real_client(*args, verify=False, **kwargs)
+
+        import app.pihole as ph
+
+        orig = ph.httpx.Client
+        ph.httpx.Client = client_factory  # type: ignore[misc]
+        try:
+            result = fetch_pihole_dns(
+                PiHoleConfig(url="http://192.168.1.52:8080/admin/", version="auto"),
+                password_override="secret",
+                token_override="leftover-v5-token",
+            )
+        finally:
+            ph.httpx.Client = orig  # type: ignore[misc]
+
+        self.assertTrue(result.ok, result.message)
+        self.assertEqual(result.version, "6")
+        self.assertEqual(len(result.records), 1)
+        self.assertFalse(seen_v5, "must not call v5 customdns when v6 detected")
+
 
 if __name__ == "__main__":
     unittest.main()

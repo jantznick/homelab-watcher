@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import {
   fetchDns,
   type DnsInventoryPayload,
@@ -25,10 +25,33 @@ function portLabel(r: DnsRecordRow): string {
   return "—";
 }
 
+/** Matched when Container column shows a name (not —). */
+function hasContainer(r: DnsRecordRow): boolean {
+  return Boolean(r.container?.trim());
+}
+
+type DnsScope = "all" | "nocontainer";
+
+const DNS_SCOPES: readonly DnsScope[] = ["all", "nocontainer"];
+
+function scopeFromSearch(params: URLSearchParams): DnsScope {
+  const raw = params.get("scope");
+  if (raw && (DNS_SCOPES as readonly string[]).includes(raw)) {
+    return raw as DnsScope;
+  }
+  return "all";
+}
+
 export function DnsPanel() {
+  const [searchParams, setSearchParams] = useSearchParams();
   const [data, setData] = useState<DnsInventoryPayload | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [scope, setScope] = useState<DnsScope>(() => scopeFromSearch(searchParams));
   const [query, setQuery] = useState("");
+
+  useEffect(() => {
+    setScope(scopeFromSearch(searchParams));
+  }, [searchParams]);
 
   useEffect(() => {
     let cancelled = false;
@@ -63,14 +86,29 @@ export function DnsPanel() {
     };
   }, []);
 
+  function selectScope(next: DnsScope) {
+    setScope(next);
+    if (next === "all") {
+      setSearchParams({}, { replace: true });
+      return;
+    }
+    setSearchParams({ scope: next }, { replace: true });
+  }
+
   const pihole = data?.pihole;
   const records = data?.records || [];
   const networking = data?.networking;
 
+  const noContainerCount = useMemo(
+    () => records.filter((r) => !hasContainer(r)).length,
+    [records],
+  );
+
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
-    if (!q) return records;
     return records.filter((r: DnsRecordRow) => {
+      if (scope === "nocontainer" && hasContainer(r)) return false;
+      if (!q) return true;
       const hay = [
         r.hostname,
         r.type,
@@ -83,7 +121,7 @@ export function DnsPanel() {
         .toLowerCase();
       return hay.includes(q);
     });
-  }, [records, query]);
+  }, [records, query, scope]);
 
   const notConfigured = pihole && !pihole.configured;
   const fetchFailed = pihole?.configured && pihole.ok === false;
@@ -98,6 +136,40 @@ export function DnsPanel() {
       </div>
 
       <div className="container-toolbar">
+        <div className="scope-tabs-rail">
+          <div className="scope-tabs" role="tablist" aria-label="DNS scope">
+            {(
+              [
+                ["all", `All (${records.length})`],
+                [
+                  "nocontainer",
+                  noContainerCount > 0
+                    ? `No container (${noContainerCount})`
+                    : "No container",
+                ],
+              ] as const
+            ).map(([id, label]) => (
+              <button
+                key={id}
+                type="button"
+                role="tab"
+                aria-selected={scope === id}
+                className={
+                  scope === id
+                    ? id === "all"
+                      ? "scope-tab active scope-tab-all"
+                      : "scope-tab active"
+                    : id === "all"
+                      ? "scope-tab scope-tab-all"
+                      : "scope-tab"
+                }
+                onClick={() => selectScope(id)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
         <input
           className="container-search"
           type="search"

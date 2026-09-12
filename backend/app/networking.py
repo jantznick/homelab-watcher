@@ -1,4 +1,12 @@
-"""Join DNS (Pi-hole) → reverse-proxy routes → Docker containers."""
+"""Join DNS (Pi-hole) → reverse-proxy routes → Docker containers.
+
+Join chain only (no hostname≈container-name fuzzy matching):
+  container published/external port
+    → Caddy upstream port (and upstream host when present)
+    → Caddy site domain
+    → Pi-hole DNS A/AAAA target IP
+    → host network IP
+"""
 
 from __future__ import annotations
 
@@ -7,9 +15,8 @@ import re
 from typing import Any
 from urllib.parse import urlparse
 
-from app.access_urls import hostname_from_url
 from app.caddy_routes import ProxyRoute, RouteDiscoveryResult, discover_caddy_routes
-from app.container_enrich import correlate_pihole
+from app.container_enrich import clear_pihole_fields, pihole_status_dict
 from app.pihole import PiHoleResult
 
 logger = logging.getLogger(__name__)
@@ -24,13 +31,11 @@ _LOCAL_UPSTREAM_HOSTS = {
     "gateway.docker.internal",
 }
 
+_IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+
 
 def _norm(s: str) -> str:
     return (s or "").strip().lower().rstrip(".")
-
-
-def _first_label(hostname: str) -> str:
-    return _norm(hostname).split(".", 1)[0]
 
 
 def _parse_upstream(upstream: str) -> tuple[str | None, int | None]:
@@ -47,7 +52,6 @@ def _parse_upstream(upstream: str) -> tuple[str | None, int | None]:
     host = raw
     port: int | None = None
     if raw.startswith("[") and "]" in raw:
-        # [ipv6]:port
         bracket, _, rest = raw.partition("]")
         host = bracket[1:]
         if rest.startswith(":") and rest[1:].isdigit():
@@ -60,14 +64,58 @@ def _parse_upstream(upstream: str) -> tuple[str | None, int | None]:
     return host.lower(), port
 
 
-def _container_port_set(container: dict[str, Any]) -> set[int]:
+def _is_ip_literal(host: str | None) -> bool:
+    if not host:
+        return False
+    h = host.strip().lower()
+    if _IPV4_RE.match(h):
+        return True
+    if ":" in h and not h.replace(":", "").isdigit():
+        return True
+    return False
+
+
+def _published_host_ports(container: dict[str, Any]) -> set[int]:
+    """Host-facing published ports (left side of host:port->container)."""
     ports: set[int] = set()
     for line in container.get("published_ports") or []:
-        # "0.0.0.0:8080->80/tcp" or "80/tcp"
         text = str(line)
         m = re.search(r":(\d+)->(\d+)", text)
         if m:
             ports.add(int(m.group(1)))
+            continue
+        # Bare EXPOSE-only lines are not external publishes.
+    inspect = container.get("inspect") or {}
+    ns = inspect.get("NetworkSettings") or {}
+    for _cport, bindings in ((ns.get("Ports") or {}) or {}).items():
+        if not isinstance(bindings, list):
+            continue
+        for b in bindings:
+            if not isinstance(b, dict):
+                continue
+            hport = str(b.get("HostPort") or "").strip()
+            if hport.isdigit():
+                ports.add(int(hport))
+    hc = (inspect.get("HostConfig") or {}).get("PortBindings") or {}
+    for _cport, bindings in (hc or {}).items():
+        if not isinstance(bindings, list):
+            continue
+        for b in bindings:
+            if not isinstance(b, dict):
+                continue
+            hport = str(b.get("HostPort") or "").strip()
+            if hport.isdigit():
+                ports.add(int(hport))
+    return ports
+
+
+def _container_listen_ports(container: dict[str, Any]) -> set[int]:
+    """Container-side listen/expose ports (right side of publish, EXPOSE)."""
+    ports: set[int] = set()
+    for line in container.get("published_ports") or []:
+        text = str(line)
+        m = re.search(r":(\d+)->(\d+)", text)
+        if m:
             ports.add(int(m.group(2)))
             continue
         m2 = re.match(r"(\d+)/", text)
@@ -79,7 +127,6 @@ def _container_port_set(container: dict[str, Any]) -> set[int]:
         num = str(cport).split("/", 1)[0]
         if num.isdigit():
             ports.add(int(num))
-    # ExposedPorts from Config
     cfg = inspect.get("Config") or {}
     for cport in (cfg.get("ExposedPorts") or {}) or {}:
         num = str(cport).split("/", 1)[0]
@@ -89,6 +136,7 @@ def _container_port_set(container: dict[str, Any]) -> set[int]:
 
 
 def _network_aliases(container: dict[str, Any]) -> set[str]:
+    """Exact Docker network DNS names / compose service aliases (not domain labels)."""
     aliases: set[str] = set()
     name = _norm(container.get("name") or "")
     if name:
@@ -111,71 +159,195 @@ def _network_aliases(container: dict[str, Any]) -> set[str]:
             na = _norm(str(a))
             if na:
                 aliases.add(na)
-        dns_names = net.get("DNSNames") or []
-        for a in dns_names:
+        for a in net.get("DNSNames") or []:
             na = _norm(str(a))
             if na:
                 aliases.add(na)
     return aliases
 
 
+def _container_ips(container: dict[str, Any]) -> set[str]:
+    ips: set[str] = set()
+    inspect = container.get("inspect") or {}
+    ns = inspect.get("NetworkSettings") or {}
+    for key in ("IPAddress", "GlobalIPv6Address"):
+        raw = (ns.get(key) or "").strip()
+        if raw:
+            ips.add(raw.lower())
+    for net in (ns.get("Networks") or {}).values():
+        if not isinstance(net, dict):
+            continue
+        for key in ("IPAddress", "GlobalIPv6Address"):
+            raw = (net.get(key) or "").strip()
+            if raw:
+                ips.add(raw.lower())
+    return ips
+
+
+def collect_host_network_ips() -> set[str]:
+    """
+    Host IPv4/IPv6 from host netns (/proc) when available.
+
+    Fail-soft: never calls psutil (can abort in restricted environments).
+    Empty set means DNS↔host IP checks are skipped (Caddy port join still works).
+    """
+    out: set[str] = set()
+    try:
+        from pathlib import Path
+
+        from app.config import get_settings
+        from app.host_metrics import _ipv4_from_fib_trie, _ipv6_by_iface
+
+        host_proc = Path(get_settings().host_proc)
+        net_dir = host_proc / "1" / "net"
+        if not (net_dir / "dev").is_file():
+            net_dir = host_proc / "net"
+        if not (net_dir / "dev").is_file():
+            return out
+        # Inside Docker without real host netns, /host/proc/net is often the
+        # container — still useful if it exposes the lab's front-door addresses.
+        if (net_dir / "fib_trie").is_file():
+            for ip in _ipv4_from_fib_trie(net_dir / "fib_trie"):
+                a = str(ip or "").strip().lower()
+                if a and not a.startswith("127."):
+                    out.add(a)
+        if (net_dir / "if_inet6").is_file():
+            for addrs in _ipv6_by_iface(net_dir / "if_inet6").values():
+                for ip in addrs:
+                    a = str(ip or "").split("%")[0].strip().lower()
+                    if (
+                        a
+                        and a != "::1"
+                        and not a.startswith("fe80:")
+                    ):
+                        out.add(a)
+    except Exception as exc:
+        logger.debug("host network IPs unavailable: %s", exc)
+        return set()
+    return out
+
+
+def _dns_a_targets_by_host(
+    pihole: PiHoleResult | None,
+) -> dict[str, set[str]]:
+    """Normalized hostname → resolved A/AAAA target IPs (CNAME one hop)."""
+    if pihole is None or not pihole.ok or not pihole.records:
+        return {}
+    direct: dict[str, set[str]] = {}
+    cnames: dict[str, str] = {}
+    for rec in pihole.records:
+        hn = _norm(rec.hostname)
+        if not hn:
+            continue
+        kind = (rec.kind or "a").strip().lower()
+        target = (rec.target or "").strip()
+        if not target:
+            continue
+        if kind == "cname":
+            cnames[hn] = _norm(target)
+            continue
+        # a / aaaa / hosts-line
+        direct.setdefault(hn, set()).add(target.lower())
+
+    out: dict[str, set[str]] = {k: set(v) for k, v in direct.items()}
+    for hn, target_hn in cnames.items():
+        if target_hn in direct:
+            out.setdefault(hn, set()).update(direct[target_hn])
+    return out
+
+
+def dns_target_matches_host(
+    hostname: str,
+    *,
+    dns_targets: dict[str, set[str]],
+    host_ips: set[str],
+) -> bool:
+    """True when Pi-hole A/AAAA for hostname points at a host network IP."""
+    if not host_ips:
+        return False
+    targets = dns_targets.get(_norm(hostname)) or set()
+    if not targets:
+        return False
+    return bool(targets & host_ips)
+
+
+def _label_declares_hostname(container: dict[str, Any], hostname: str) -> bool:
+    """Exact Caddy site label on this container (not fuzzy substring of name)."""
+    hn = _norm(hostname)
+    if not hn:
+        return False
+    labels = container.get("labels") or {}
+    for key, raw in labels.items():
+        if not re.match(r"^caddy(?:_\d+)?$", str(key), re.I):
+            continue
+        # Label value is the site address block — require exact host token match.
+        for part in re.split(r"[\s,]+", _norm(str(raw))):
+            token = part.split(":", 1)[0].strip()
+            if token == hn:
+                return True
+    return False
+
+
 def _match_score(
     route: ProxyRoute,
     container: dict[str, Any],
+    *,
+    host_ips: set[str],
 ) -> int:
-    """Higher = better match. 0 = no match."""
+    """
+    Higher = better match. 0 = no match.
+
+    Requires upstream port. Matches published host port, or docker-network
+    upstream (exact alias) + container listen port. Never matches domain text
+    to container/image names.
+    """
     host, port = _parse_upstream(route.upstream)
+    if port is None:
+        # Label-only site on this container with no upstream port — still a join
+        # when the Caddy label on *this* container declares the hostname.
+        if route.source == "label" and _label_declares_hostname(
+            container, route.hostname
+        ):
+            return 40
+        return 0
+
+    pub = _published_host_ports(container)
+    listen = _container_listen_ports(container)
     aliases = _network_aliases(container)
-    ports = _container_port_set(container)
+    cip = _container_ips(container)
     score = 0
 
+    port_ok = False
+    if port in pub:
+        score += 50
+        port_ok = True
+    elif host and host not in _LOCAL_UPSTREAM_HOSTS and not _is_ip_literal(host):
+        # Docker-network upstream: reverse_proxy service:port
+        if host in aliases and port in listen:
+            score += 45
+            port_ok = True
+    if not port_ok:
+        return 0
+
     if host:
-        if host in aliases:
-            score += 50
-        elif _first_label(host) in aliases:
-            score += 35
-        elif host in _LOCAL_UPSTREAM_HOSTS:
-            # localhost-style upstream: port is the signal
-            score += 5
-        else:
-            # weak: hostname first label vs container tokens
-            fl = _first_label(host)
-            if fl and fl in aliases:
-                score += 30
-
-    if port is not None:
-        if port in ports:
+        if host in _LOCAL_UPSTREAM_HOSTS:
+            score += 10
+        elif _is_ip_literal(host):
+            h = host.lower()
+            if h in cip or h in host_ips:
+                score += 25
+            elif h in ("0.0.0.0", "::"):
+                score += 5
+            else:
+                # Upstream IP is neither this container nor this host — reject
+                return 0
+        elif host in aliases:
             score += 25
-        elif host and host in _LOCAL_UPSTREAM_HOSTS:
-            # local upstream with unmatched port — weak
-            score += 0
-        elif not host:
-            if port in ports:
-                score += 20
+        else:
+            # Named upstream that isn't this container's docker DNS name
+            return 0
 
-    # Label-sourced routes for this exact container are strong
-    if route.source == "label":
-        name = _norm(container.get("name") or "")
-        up_host, _ = _parse_upstream(route.upstream)
-        if up_host and name and (up_host == name or up_host in aliases):
-            score += 40
-        # site label on this container without upstream still counts
-        labels = container.get("labels") or {}
-        for key, raw in labels.items():
-            if not re.match(r"^caddy(?:_\d+)?$", str(key), re.I):
-                continue
-            if route.hostname and route.hostname in _norm(str(raw)):
-                score += 45
-                break
-
-    # Access URL host equals route hostname
-    access = hostname_from_url(container.get("access_url"))
-    if access and route.hostname and (
-        access == route.hostname
-        or access.endswith("." + route.hostname)
-        or route.hostname.endswith("." + access)
-        or _first_label(access) == _first_label(route.hostname)
-    ):
+    if route.source == "label" and _label_declares_hostname(container, route.hostname):
         score += 20
 
     return score
@@ -184,11 +356,14 @@ def _match_score(
 def match_route_to_containers(
     route: ProxyRoute,
     containers: list[dict[str, Any]],
+    *,
+    host_ips: set[str] | None = None,
 ) -> list[tuple[dict[str, Any], int]]:
+    ips = host_ips if host_ips is not None else collect_host_network_ips()
     scored: list[tuple[dict[str, Any], int]] = []
     for c in containers:
-        s = _match_score(route, c)
-        if s >= 25:  # threshold: need a real signal
+        s = _match_score(route, c, host_ips=ips)
+        if s > 0:
             scored.append((c, s))
     scored.sort(key=lambda x: -x[1])
     return scored
@@ -207,14 +382,15 @@ def enrich_networking(
     Returns a serializable networking status for the API / poll snapshot.
     """
     proxy = (proxy_type or "none").lower().strip()
-    dns_hosts: set[str] = set()
-    if pihole and pihole.ok and pihole.records:
-        dns_hosts = {_norm(r.hostname) for r in pihole.records if r.hostname}
+    host_ips = collect_host_network_ips()
+    dns_targets = _dns_a_targets_by_host(pihole)
+    pihole_active = bool(pihole and pihole.configured and pihole.ok)
 
-    # Always clear first
+    # Always clear first — never leave fuzzy leftovers
     for c in containers:
         c["networking"] = {"mapped": False, "entries": []}
         c["proxy_matched"] = False
+    clear_pihole_fields(containers)
 
     status: dict[str, Any] = {
         "proxy_type": proxy,
@@ -225,35 +401,28 @@ def enrich_networking(
         "message": None,
         "errors": [],
         "sources_tried": [],
+        "host_ip_count": len(host_ips),
     }
 
     if proxy in ("", "none"):
-        # Hostname-only Pi-hole correlation (legacy path)
-        if pihole is not None:
-            ph_status = correlate_pihole(containers, pihole)
-            status["ok"] = ph_status.get("ok")
-            status["message"] = "Proxy off — matching Pi-hole hostnames only"
-            return {**status, "pihole": ph_status}
-        for c in containers:
-            c.setdefault("pihole_matched", False)
-            c.setdefault("pihole_hostnames", [])
         status["ok"] = True
-        status["message"] = "Proxy type is None"
+        status["message"] = "Proxy off — no domain↔container joins without Caddy"
+        if pihole is not None:
+            status["pihole"] = pihole_status_dict(pihole)
         return status
 
     if proxy == "traefik":
         status["ok"] = False
         status["message"] = "Traefik route discovery is coming soon"
-        # Still run Pi-hole hostname fallback so DNS badges keep working
         if pihole is not None:
-            correlate_pihole(containers, pihole)
+            status["pihole"] = pihole_status_dict(pihole)
         return status
 
     if proxy != "caddy":
         status["ok"] = False
         status["message"] = f"Unknown proxy type: {proxy}"
         if pihole is not None:
-            correlate_pihole(containers, pihole)
+            status["pihole"] = pihole_status_dict(pihole)
         return status
 
     discovery = discovery or RouteDiscoveryResult(ok=False)
@@ -264,38 +433,42 @@ def enrich_networking(
     if not discovery.routes:
         status["ok"] = False if discovery.errors else True
         status["message"] = discovery.message or "No Caddy routes discovered"
-        # Fall back to hostname correlation so Pi-hole badges still appear
         if pihole is not None:
-            correlate_pihole(containers, pihole)
+            status["pihole"] = pihole_status_dict(pihole)
         return status
 
     status["ok"] = True
 
-    # Index routes by hostname
     routes_by_host: dict[str, list[ProxyRoute]] = {}
     for r in discovery.routes:
         routes_by_host.setdefault(r.hostname, []).append(r)
 
-    mapped = 0
-    # Prefer routes that appear in Pi-hole when DNS is configured; still map others
-    host_list = list(routes_by_host.keys())
-    if dns_hosts:
-        # Put DNS-overlapping hosts first
-        host_list.sort(key=lambda h: (0 if h in dns_hosts else 1, h))
-
-    for hostname in host_list:
+    for hostname in sorted(routes_by_host.keys()):
         routes = routes_by_host[hostname]
-        in_dns = hostname in dns_hosts if dns_hosts else False
+        # DNS badge / chain step: A/AAAA must point at a host network IP.
+        # If Pi-hole is up and this hostname exists in DNS with a wrong IP,
+        # do not attach the domain to a container.
+        dns_ips = dns_targets.get(_norm(hostname))
+        if pihole_active and dns_ips is not None:
+            if host_ips and not (dns_ips & host_ips):
+                continue
+            in_dns = bool(host_ips and (dns_ips & host_ips))
+        elif pihole_active and dns_ips is None:
+            # Hostname not in Pi-hole — Caddy-only mapping, no DNS badge
+            in_dns = False
+        else:
+            in_dns = False
+
         for route in routes:
-            matches = match_route_to_containers(route, containers)
+            matches = match_route_to_containers(
+                route, containers, host_ips=host_ips
+            )
             if not matches:
                 continue
-            # Assign best match; if close seconds, assign top only to avoid fan-out
             best_c, best_s = matches[0]
             assigned = [best_c]
             for other, sc in matches[1:]:
                 if sc >= best_s and sc >= 50:
-                    # equally strong (e.g. same service replicas) — skip extras
                     break
             for c in assigned:
                 entry = {
@@ -307,7 +480,6 @@ def enrich_networking(
                 }
                 net = c.setdefault("networking", {"mapped": False, "entries": []})
                 entries = net.setdefault("entries", [])
-                # dedupe
                 if any(
                     e.get("hostname") == entry["hostname"]
                     and e.get("upstream") == entry["upstream"]
@@ -317,9 +489,7 @@ def enrich_networking(
                 entries.append(entry)
                 net["mapped"] = True
                 c["proxy_matched"] = True
-                mapped += 1
 
-                # Keep Pi-hole badge fields in sync when the hostname is in DNS
                 if in_dns:
                     hosts = list(c.get("pihole_hostnames") or [])
                     if route.hostname not in hosts:
@@ -327,23 +497,14 @@ def enrich_networking(
                     c["pihole_hostnames"] = sorted(set(hosts))
                     c["pihole_matched"] = True
 
-    # Containers with DNS names that matched via fuzzy fallback when no proxy hit
-    if pihole is not None and pihole.ok and pihole.records:
-        unmatched = [
-            c
-            for c in containers
-            if not (c.get("networking") or {}).get("mapped")
-        ]
-        if unmatched:
-            # Temporary list for correlate — only fill empty ones
-            correlate_pihole(unmatched, pihole)
-
     status["mapped_count"] = sum(
         1 for c in containers if (c.get("networking") or {}).get("mapped")
     )
     status["message"] = (
         f"{status['route_count']} routes · {status['mapped_count']} containers mapped"
     )
+    if pihole is not None:
+        status["pihole"] = pihole_status_dict(pihole)
     return status
 
 
@@ -352,7 +513,6 @@ def _dns_record_type(kind: str, target: str) -> str:
     if k == "cname":
         return "CNAME"
     if k in ("aaaa", "a"):
-        # Hosts lines are stored as kind "a"; classify AAAA by IPv6 shape.
         t = (target or "").strip()
         if k == "aaaa" or (":" in t and not t.replace(":", "").isdigit()):
             return "AAAA"
@@ -366,8 +526,7 @@ def hostname_to_container_via_proxy(
     """
     Map normalized hostname → container match from networking join results.
 
-    Only uses Caddy/proxy route assignments (running or stopped). Does not use
-    fuzzy Pi-hole hostname correlation.
+    Only uses Caddy/proxy route assignments. Never fuzzy Pi-hole names.
     """
     by_host: dict[str, dict[str, Any]] = {}
     for c in containers:
@@ -399,14 +558,24 @@ def build_dns_inventory(
 ) -> list[dict[str, Any]]:
     """
     Local DNS rows for the DNS page: domain → port → container (Caddy join).
+
+    Container column is filled only from proxy join results — never fuzzy names.
+    When host IPs are known, require DNS target ∈ host IPs before linking.
     """
     if pihole is None or not pihole.configured or not pihole.ok:
         return []
     by_host = hostname_to_container_via_proxy(containers)
+    host_ips = collect_host_network_ips()
+    dns_targets = _dns_a_targets_by_host(pihole)
     rows: list[dict[str, Any]] = []
     for rec in pihole.records:
         hn = _norm(rec.hostname)
         match = by_host.get(hn) if hn else None
+        if match and host_ips:
+            targets = dns_targets.get(hn) or set()
+            # CNAME without resolved A, or A pointing off-host → no container link
+            if not targets or not (targets & host_ips):
+                match = None
         port = (match or {}).get("port")
         rows.append(
             {
@@ -423,6 +592,94 @@ def build_dns_inventory(
             }
         )
     rows.sort(key=lambda r: (str(r.get("hostname") or ""), str(r.get("type") or "")))
+    return rows
+
+
+def build_caddy_inventory(
+    containers: list[dict[str, Any]],
+    discovery: RouteDiscoveryResult | None,
+) -> list[dict[str, Any]]:
+    """
+    Caddy site rows for the Caddy page: domain → upstream/port → container.
+    """
+    by_host = hostname_to_container_via_proxy(containers)
+    routes = list(discovery.routes) if discovery and discovery.routes else []
+    host_ips = collect_host_network_ips()
+
+    if not routes:
+        rows: list[dict[str, Any]] = []
+        for hn, match in by_host.items():
+            port = match.get("port")
+            rows.append(
+                {
+                    "hostname": hn,
+                    "upstream": match.get("upstream") or None,
+                    "port": port if isinstance(port, int) else None,
+                    "container": match.get("name") or None,
+                    "container_id": match.get("container_id") or None,
+                    "container_state": match.get("state") or None,
+                    "source": match.get("source") or None,
+                    "proxy": match.get("proxy") or "caddy",
+                    "in_dns": bool(match.get("in_dns")),
+                }
+            )
+        rows.sort(key=lambda r: str(r.get("hostname") or ""))
+        return rows
+
+    rows = []
+    seen: set[tuple[str, str]] = set()
+    for route in routes:
+        hn = _norm(route.hostname)
+        if not hn:
+            continue
+        key = (hn, route.upstream or "")
+        if key in seen:
+            continue
+        seen.add(key)
+
+        match = by_host.get(hn)
+        if not match:
+            scored = match_route_to_containers(
+                route, containers, host_ips=host_ips
+            )
+            if scored:
+                c, _ = scored[0]
+                up = route.upstream or ""
+                _h, port = _parse_upstream(up)
+                match = {
+                    "name": c.get("name") or "",
+                    "container_id": c.get("container_id") or "",
+                    "state": c.get("state") or c.get("status") or "",
+                    "upstream": up,
+                    "port": port,
+                    "in_dns": False,
+                }
+
+        upstream = route.upstream or (match or {}).get("upstream") or ""
+        _h, port = _parse_upstream(upstream)
+        if port is None and match and isinstance(match.get("port"), int):
+            port = match["port"]
+
+        rows.append(
+            {
+                "hostname": route.hostname,
+                "upstream": upstream or None,
+                "port": port if isinstance(port, int) else None,
+                "container": (match or {}).get("name") or None,
+                "container_id": (match or {}).get("container_id") or None,
+                "container_state": (match or {}).get("state") or None,
+                "source": route.source,
+                "proxy": "caddy",
+                "in_dns": bool((match or {}).get("in_dns")),
+            }
+        )
+
+    rows.sort(
+        key=lambda r: (
+            str(r.get("hostname") or ""),
+            str(r.get("upstream") or ""),
+        )
+    )
     return rows
 
 
@@ -463,24 +720,23 @@ def discover_and_enrich(
                     timeout=timeout,
                     verify_tls=verify_tls,
                 )
-        return enrich_networking(
+        status = enrich_networking(
             containers,
             proxy_type=proxy,
             discovery=discovery,
             pihole=pihole,
         )
+        if proxy == "caddy":
+            status["route_rows"] = build_caddy_inventory(containers, discovery)
+        else:
+            status["route_rows"] = []
+        return status
     except Exception as exc:
         logger.warning("Networking enrichment failed: %s", exc)
         for c in containers:
             c.setdefault("networking", {"mapped": False, "entries": []})
             c.setdefault("proxy_matched", False)
-            c.setdefault("pihole_matched", False)
-            c.setdefault("pihole_hostnames", [])
-        if pihole is not None:
-            try:
-                correlate_pihole(containers, pihole)
-            except Exception:
-                pass
+        clear_pihole_fields(containers)
         return {
             "proxy_type": proxy,
             "configured": proxy not in ("", "none"),
@@ -490,4 +746,5 @@ def discover_and_enrich(
             "message": str(exc),
             "errors": [str(exc)],
             "sources_tried": [],
+            "route_rows": [],
         }

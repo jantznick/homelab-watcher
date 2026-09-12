@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from typing import Any
 
@@ -50,11 +51,13 @@ from app.runtime_settings import (
 )
 from app.docker_client import get_container_logs, get_docker_error
 from app.scheduler import (
+    apply_pihole_result,
     get_last_dns,
     get_last_networking,
     get_last_pihole,
     get_poll_status,
     poll_once,
+    refresh_pihole_dns_snapshot,
     reschedule_digest,
     reschedule_poll,
     reschedule_speed_test,
@@ -68,6 +71,7 @@ from app.security_trivy import trivy_available
 from app.speed_test import clear_speed_test_pending, mark_speed_test_pending, speed_test_busy
 
 router = APIRouter(prefix="/api")
+logger = logging.getLogger(__name__)
 
 
 def _parse_raw(row: dict[str, Any]) -> dict[str, Any]:
@@ -275,6 +279,14 @@ def containers() -> dict[str, Any]:
 def dns_records() -> dict[str, Any]:
     """Local DNS inventory from last poll (Pi-hole + Caddy/container join)."""
     return get_last_dns()
+
+
+@router.get("/caddy")
+def caddy_records() -> dict[str, Any]:
+    """Discovered Caddy site routes from last poll (Admin API / Caddyfile / labels)."""
+    from app.scheduler import get_last_caddy
+
+    return get_last_caddy()
 
 
 # ----- per-container description / notes (before /containers/{id}) -----
@@ -1024,6 +1036,12 @@ def put_pihole(body: PiHoleSettingsBody) -> dict[str, Any]:
     elif body.api_token is not None and body.api_token != "":
         data["api_token"] = body.api_token
     db.set_setting("pihole", data)
+    # Keep Local DNS page in sync with saved settings (same fetch as Test).
+    try:
+        if (data.get("url") or "").strip():
+            refresh_pihole_dns_snapshot()
+    except Exception as exc:
+        logger.warning("Pi-hole save snapshot refresh skipped: %s", exc)
     return {"ok": True, "pihole": pihole_public_view()}
 
 
@@ -1033,6 +1051,7 @@ def test_pihole() -> dict[str, Any]:
 
     Always returns a clear message: record count on success, or why it failed.
     Never a silent zero without explanation.
+    Also updates the /api/dns snapshot so Local DNS matches this Test.
     """
     cfg, password, token, _src = resolve_pihole()
     if not (cfg.url or "").strip():
@@ -1054,6 +1073,8 @@ def test_pihole() -> dict[str, Any]:
     result = fetch_pihole_dns(
         cfg, password_override=password, token_override=token
     )
+    # Same records the DNS page shows — do not leave a stale poll error.
+    apply_pihole_result(result)
     count = len(result.records)
     if result.ok:
         msg = result.message or (
@@ -1112,6 +1133,7 @@ def test_networking() -> dict[str, Any]:
     """Discover proxy routes with saved settings — read-only."""
     from app.docker_client import list_containers
     from app.networking import discover_and_enrich
+    from app.scheduler import get_last_caddy, store_networking_result
 
     cfg, _ = resolve_networking()
     if cfg.proxy_type == "none":
@@ -1151,6 +1173,11 @@ def test_networking() -> dict[str, Any]:
         timeout=cfg.timeout_seconds,
         pihole=None,
     )
+    # Refresh Caddy page snapshot immediately after Test
+    try:
+        store_networking_result(dict(status))
+    except Exception:
+        pass
     ok = bool(status.get("ok")) and int(status.get("route_count") or 0) > 0
     if status.get("ok") and int(status.get("route_count") or 0) == 0:
         ok = False
@@ -1159,6 +1186,7 @@ def test_networking() -> dict[str, Any]:
         msg = f"OK — {status.get('route_count', 0)} routes discovered"
     elif status.get("errors"):
         msg = "; ".join(status.get("errors") or [])
+    snap = get_last_caddy()
     return {
         "ok": ok,
         "configured": bool(status.get("configured")),
@@ -1168,6 +1196,7 @@ def test_networking() -> dict[str, Any]:
         "mapped_count": int(status.get("mapped_count") or 0),
         "errors": status.get("errors") or [],
         "sources_tried": status.get("sources_tried") or [],
+        "records": snap.get("records") or [],
     }
 
 

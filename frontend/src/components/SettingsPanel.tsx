@@ -1,6 +1,5 @@
 import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
-import { Link } from "react-router-dom";
 import {
   fetchDiskDiscover,
   fetchFileBrowse,
@@ -614,8 +613,8 @@ export function SettingsPanel({
               Networking for real routing.
             </p>
             <p className="helper">
-              URL: host is enough. v5 uses the API token; v6 uses the web or
-              app password. Leave Version on auto unless Test fails.
+              URL: host root or /admin. v6 uses password; v5 uses API token.
+              Leave Version on auto. Test refreshes the Local DNS page.
             </p>
             <label className="field">
               Pi-hole URL
@@ -727,9 +726,6 @@ export function SettingsPanel({
               >
                 Test
               </button>
-              <Link to="/dns" className="btn">
-                View Local DNS
-              </Link>
             </div>
           </section>
         ) : null}
@@ -737,8 +733,9 @@ export function SettingsPanel({
         {tab === "networking" ? (
           <section>
             <p className="helper">
-              DNS often points every name at one IP. The reverse proxy maps
-              hostname → upstream container/port. Read-only.
+              DNS often points every name at one IP. Joins require Caddy:
+              container published port → upstream port → domain → DNS target IP
+              matching a host network IP. No hostname≈container-name guessing.
             </p>
             <label className="field">
               Proxy type
@@ -756,8 +753,8 @@ export function SettingsPanel({
 
             {netProxy === "traefik" ? (
               <p className="helper">
-                Traefik discovery isn’t implemented yet — choose Caddy, or keep
-                Pi-hole hostname matching only.
+                Traefik discovery isn’t implemented yet — choose Caddy for
+                domain↔container joins (port → upstream → DNS → host IP).
               </p>
             ) : null}
 
