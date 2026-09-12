@@ -12,6 +12,7 @@ from app import db
 from app.config import (
     AppYamlConfig,
     ListeningPortsConfig,
+    NetworkingConfig,
     PiHoleConfig,
     SecurityConfig,
     Settings,
@@ -353,6 +354,14 @@ def resolve_pihole(
 def pihole_public_view() -> dict[str, Any]:
     cfg, password, token, source = resolve_pihole()
     stored = db.get_setting("pihole") or {}
+    # Last poll / fetch status (record count + error) for Settings UI
+    last: dict[str, Any] = {}
+    try:
+        from app.scheduler import get_last_pihole
+
+        last = get_last_pihole() or {}
+    except Exception:
+        last = {}
     return {
         "source": source,
         "configured": bool((cfg.url or "").strip()),
@@ -367,6 +376,75 @@ def pihole_public_view() -> dict[str, Any]:
         "api_token_in_db": bool((stored.get("api_token") or "").strip())
         if isinstance(stored, dict)
         else False,
+        "ok": last.get("ok"),
+        "message": last.get("message"),
+        "record_count": last.get("record_count"),
+        "detected_version": last.get("version"),
+    }
+
+
+def resolve_networking(
+    settings: Settings | None = None,
+) -> tuple[NetworkingConfig, SettingSource]:
+    _ = settings  # reserved for future env overrides
+    stored = db.get_setting("networking") or {}
+    yaml_cfg = reload_yaml_config().networking
+
+    if isinstance(stored, dict) and stored:
+        proxy = str(stored.get("proxy_type") or "none").lower().strip()
+        if proxy not in ("none", "caddy", "traefik"):
+            proxy = "none"
+        cfg = NetworkingConfig(
+            proxy_type=proxy,  # type: ignore[arg-type]
+            caddy_use_admin_api=bool(
+                stored.get(
+                    "caddy_use_admin_api", yaml_cfg.caddy_use_admin_api
+                )
+            ),
+            caddy_admin_url=str(
+                stored.get("caddy_admin_url")
+                or yaml_cfg.caddy_admin_url
+                or "http://host.docker.internal:2019"
+            ).strip(),
+            caddy_use_caddyfile=bool(
+                stored.get(
+                    "caddy_use_caddyfile", yaml_cfg.caddy_use_caddyfile
+                )
+            ),
+            caddy_caddyfile_path=str(
+                stored.get("caddy_caddyfile_path")
+                or yaml_cfg.caddy_caddyfile_path
+                or "/config/Caddyfile"
+            ).strip(),
+            caddy_use_labels=bool(
+                stored.get("caddy_use_labels", yaml_cfg.caddy_use_labels)
+            ),
+            verify_tls=bool(stored.get("verify_tls", yaml_cfg.verify_tls)),
+            timeout_seconds=float(
+                stored.get("timeout_seconds") or yaml_cfg.timeout_seconds or 5.0
+            ),
+        )
+        return cfg, "db"
+
+    if yaml_cfg.proxy_type != "none":
+        return yaml_cfg, "yaml"
+
+    return NetworkingConfig(), "none"
+
+
+def networking_public_view() -> dict[str, Any]:
+    cfg, source = resolve_networking()
+    return {
+        "source": source,
+        "proxy_type": cfg.proxy_type,
+        "caddy_use_admin_api": cfg.caddy_use_admin_api,
+        "caddy_admin_url": cfg.caddy_admin_url,
+        "caddy_use_caddyfile": cfg.caddy_use_caddyfile,
+        "caddy_caddyfile_path": cfg.caddy_caddyfile_path,
+        "caddy_use_labels": cfg.caddy_use_labels,
+        "verify_tls": cfg.verify_tls,
+        "timeout_seconds": cfg.timeout_seconds,
+        "configured": cfg.proxy_type != "none",
     }
 
 
@@ -758,6 +836,7 @@ def effective_yaml_overlay() -> AppYamlConfig:
         ),
         container_urls=dict(yaml_cfg.container_urls),
         pihole=resolve_pihole()[0],
+        networking=resolve_networking()[0],
         security=security,
         listening_ports=listening_ports,
         speed_test=speed_test,

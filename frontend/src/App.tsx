@@ -4,6 +4,7 @@ import {
   Navigate,
   Route,
   Routes,
+  useLocation,
   useNavigate,
   useParams,
 } from "react-router-dom";
@@ -18,6 +19,7 @@ import {
   type ContainerItem,
   type DiskMetric,
   type DockerDiskUsage,
+  type DockerPublishedPort,
   type HostNetworkInterface,
   type ListeningPort,
   type PiHoleStatus,
@@ -26,21 +28,31 @@ import {
 } from "./api";
 import { ChecksPanel } from "./components/ChecksPanel";
 import { ContainersPanel } from "./components/ContainersPanel";
+import { DnsPanel } from "./components/DnsPanel";
 import { HomePanel } from "./components/HomePanel";
-import { HostPanel } from "./components/HostPanel";
+import {
+  HOST_TABS,
+  HostPanel,
+  isHostTabId,
+  resolveHostTab,
+  writeStoredHostTab,
+  type HostTabId,
+} from "./components/HostPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 
 const SIDEBAR_COLLAPSED_KEY = "hlw-sidebar-collapsed";
 
-type NavIcon = "home" | "containers" | "host" | "settings";
+type NavIcon = "home" | "containers" | "dns" | "host" | "settings";
 
 type NavItem = { to: string; label: string; icon: NavIcon; end?: boolean };
 
 const PRIMARY_NAV: NavItem[] = [
   { to: "/", label: "Home", icon: "home", end: true },
   { to: "/containers", label: "Containers", icon: "containers" },
-  { to: "/host", label: "Host", icon: "host" },
+  { to: "/dns", label: "DNS", icon: "dns" },
 ];
+
+const HOST_NAV: NavItem = { to: "/host", label: "Host", icon: "host" };
 
 const SETTINGS_NAV: NavItem = {
   to: "/settings",
@@ -48,7 +60,13 @@ const SETTINGS_NAV: NavItem = {
   icon: "settings",
 };
 
-const MOBILE_NAV: NavItem[] = [...PRIMARY_NAV, SETTINGS_NAV];
+/** Mobile bottom nav — DNS stays sidebar/deep-link only (no 5th tab). */
+const MOBILE_NAV: NavItem[] = [
+  { to: "/", label: "Home", icon: "home", end: true },
+  { to: "/containers", label: "Containers", icon: "containers" },
+  HOST_NAV,
+  SETTINGS_NAV,
+];
 
 function NavGlyph({ name }: { name: NavIcon }) {
   const common = {
@@ -77,6 +95,13 @@ function NavGlyph({ name }: { name: NavIcon }) {
           <path d="M3.5 11h17M8 7V5.5A1.5 1.5 0 0 1 9.5 4h5A1.5 1.5 0 0 1 16 5.5V7" />
         </svg>
       );
+    case "dns":
+      return (
+        <svg {...common}>
+          <circle cx="12" cy="12" r="8.25" />
+          <path d="M3.75 12h16.5M12 3.75c2.4 2.6 3.6 5.4 3.6 8.25S14.4 17.65 12 20.25C9.6 17.65 8.4 14.85 8.4 12S9.6 6.35 12 3.75z" />
+        </svg>
+      );
     case "host":
       return (
         <svg {...common}>
@@ -103,6 +128,47 @@ function readSidebarCollapsed(): boolean {
   } catch {
     return false;
   }
+}
+
+function HostSidebarNav({ collapsed }: { collapsed: boolean }) {
+  const location = useLocation();
+  const hostActive =
+    location.pathname === "/host" || location.pathname.startsWith("/host/");
+
+  return (
+    <div
+      className={
+        hostActive ? "nav-group nav-group-host active" : "nav-group nav-group-host"
+      }
+    >
+      <NavLink
+        to="/host"
+        title={collapsed ? "Host" : undefined}
+        aria-label={collapsed ? "Host" : undefined}
+        aria-haspopup={collapsed ? "true" : undefined}
+        className={({ isActive }) =>
+          isActive ? "nav-link active" : "nav-link"
+        }
+      >
+        <NavGlyph name="host" />
+        <span className="nav-link-label">Host</span>
+      </NavLink>
+      <div className="nav-sub" role="group" aria-label="Host sections">
+        {HOST_TABS.map((t) => (
+          <NavLink
+            key={t.id}
+            to={`/host/${t.id}`}
+            title={collapsed ? t.label : undefined}
+            className={({ isActive }) =>
+              isActive ? "nav-link nav-sub-link active" : "nav-link nav-sub-link"
+            }
+          >
+            <span className="nav-link-label">{t.label}</span>
+          </NavLink>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 function SettingsRoute({ onSaved }: { onSaved: () => void }) {
@@ -135,6 +201,8 @@ function HostRoute(props: {
   listeningPortsEnabled: boolean | null;
   listeningPortsNote: string | null;
   listeningPortsSource: string | null;
+  dockerPublishedPorts: DockerPublishedPort[];
+  dockerPublishedNote: string | null;
   dockerDisk: DockerDiskUsage | null;
   dockerDiskLoading: boolean;
   actionsEnabled: boolean;
@@ -147,10 +215,30 @@ function HostRoute(props: {
   speedTest: SpeedTestInfo | null;
   onSpeedTestChange: () => void;
 }) {
+  const { section } = useParams();
   const navigate = useNavigate();
+  const tab = resolveHostTab(section);
+
+  useEffect(() => {
+    const target = resolveHostTab(section);
+    const needsNormalize =
+      !isHostTabId(section) || window.location.hash === "#docker-disk";
+    if (needsNormalize) {
+      navigate(`/host/${target}`, { replace: true });
+    }
+    writeStoredHostTab(target);
+  }, [section, navigate]);
+
+  function onTabChange(next: HostTabId) {
+    writeStoredHostTab(next);
+    navigate(`/host/${next}`);
+  }
+
   return (
     <HostPanel
       {...props}
+      tab={tab}
+      onTabChange={onTabChange}
       onOpenDiskSettings={() => navigate("/settings/disks")}
     />
   );
@@ -183,6 +271,12 @@ export default function App() {
     null,
   );
   const [listeningPortsSource, setListeningPortsSource] = useState<string | null>(
+    null,
+  );
+  const [dockerPublishedPorts, setDockerPublishedPorts] = useState<
+    DockerPublishedPort[]
+  >([]);
+  const [dockerPublishedNote, setDockerPublishedNote] = useState<string | null>(
     null,
   );
   const [uptimeSeconds, setUptimeSeconds] = useState<number | null>(null);
@@ -263,6 +357,8 @@ export default function App() {
         );
         setListeningPortsNote(h.listening_ports_note ?? null);
         setListeningPortsSource(h.listening_ports_source ?? null);
+        setDockerPublishedPorts(h.docker_published_ports || []);
+        setDockerPublishedNote(h.docker_published_ports_note ?? null);
         setUptimeSeconds(
           typeof h.uptime_seconds === "number" ? h.uptime_seconds : null,
         );
@@ -395,10 +491,24 @@ export default function App() {
             </svg>
           </button>
         </div>
-        {renderNav(PRIMARY_NAV, "Main", "sidebar-nav", {
-          iconOnly: sidebarCollapsed,
-          id: "sidebar-nav",
-        })}
+        <nav className="sidebar-nav" aria-label="Main" id="sidebar-nav">
+          {PRIMARY_NAV.map((item) => (
+            <NavLink
+              key={item.to}
+              to={item.to}
+              end={item.end}
+              title={sidebarCollapsed ? item.label : undefined}
+              aria-label={sidebarCollapsed ? item.label : undefined}
+              className={({ isActive }) =>
+                isActive ? "nav-link active" : "nav-link"
+              }
+            >
+              <NavGlyph name={item.icon} />
+              <span className="nav-link-label">{item.label}</span>
+            </NavLink>
+          ))}
+          <HostSidebarNav collapsed={sidebarCollapsed} />
+        </nav>
         <div className="sidebar-foot">
           {renderNav([SETTINGS_NAV], "Settings", "sidebar-settings", {
             iconOnly: sidebarCollapsed,
@@ -434,6 +544,7 @@ export default function App() {
                     dockerDisk={dockerDisk}
                     listeningPorts={listeningPorts}
                     listeningPortsEnabled={listeningPortsEnabled}
+                    dockerPublishedPorts={dockerPublishedPorts}
                     cpu={cpu}
                     mem={mem}
                     memUsed={memUsed}
@@ -466,8 +577,9 @@ export default function App() {
                 />
               }
             />
+            <Route path="/dns" element={<DnsPanel />} />
             <Route
-              path="/host"
+              path="/host/:section?"
               element={
                 <HostRoute
                   cpu={cpu}
@@ -485,6 +597,8 @@ export default function App() {
                   listeningPortsEnabled={listeningPortsEnabled}
                   listeningPortsNote={listeningPortsNote}
                   listeningPortsSource={listeningPortsSource}
+                  dockerPublishedPorts={dockerPublishedPorts}
+                  dockerPublishedNote={dockerPublishedNote}
                   dockerDisk={dockerDisk}
                   dockerDiskLoading={dockerDiskLoading}
                   actionsEnabled={actionsEnabled}

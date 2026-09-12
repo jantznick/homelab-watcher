@@ -17,7 +17,8 @@ services:
       # For inventory-only, you may use :ro and disable actions in Settings → General.
       - /var/run/docker.sock:/var/run/docker.sock
       # Full host root (read-only) so CPU/RAM, disk mounts under /mnt/...,
-      # and listening-port inventory (host /proc/net via HOST_PROC) are visible.
+      # and host listening ports (HOST_PROC=/host/proc → /host/proc/1/net/*)
+      # are visible. Do not use the container's /proc/net for "open ports".
       # Configure disks in Settings → Disks; ports + speed in Settings → Host.
       # Also lets Compose-first Update resolve project.working_dir / config_files
       # under /host/... when stacks live on the host (see README).
@@ -26,6 +27,9 @@ services:
       # or if a path is missing under the host root mount:
       # - /home/user/stacks:/home/user/stacks:ro
       - ./config.yaml:/config/config.yaml:ro
+      # Optional: mount your host Caddyfile read-only so Settings → Networking
+      # can parse routes (set path to /config/Caddyfile in the UI).
+      # - /etc/caddy/Caddyfile:/config/Caddyfile:ro
       - watcher-data:/data
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -34,6 +38,9 @@ services:
     #   - "traefik.enable=true"
     #   - "traefik.http.routers.homelab-watcher.rule=Host(`watcher.example.com`)"
     #   - "traefik.http.services.homelab-watcher.loadbalancer.server.port=8080"
+    #   # caddy-docker-proxy example:
+    #   # - "caddy=watcher.example.com"
+    #   # - "caddy.reverse_proxy={{upstreams 8080}}"
 
 volumes:
   watcher-data:

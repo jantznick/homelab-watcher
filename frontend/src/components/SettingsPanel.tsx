@@ -1,14 +1,18 @@
 import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
+import { Link } from "react-router-dom";
 import {
   fetchDiskDiscover,
+  fetchFileBrowse,
   fetchSettings,
   putSettings,
   runHostSpeedTest,
   sendTestDigest,
+  testNetworking,
   testPihole,
   testPlex,
   type DiskMetric,
+  type FileBrowseEntry,
   type SettingsPayload,
 } from "../api";
 import { useScrollLock } from "../hooks/useScrollLock";
@@ -17,6 +21,7 @@ type Tab =
   | "general"
   | "plex"
   | "pihole"
+  | "networking"
   | "checks"
   | "email"
   | "security"
@@ -26,6 +31,7 @@ type Tab =
 const TABS: { id: Tab; label: string }[] = [
   { id: "plex", label: "Plex" },
   { id: "pihole", label: "Pi-hole" },
+  { id: "networking", label: "Networking" },
   { id: "checks", label: "Checks" },
   { id: "email", label: "Email" },
   { id: "disks", label: "Disks" },
@@ -114,6 +120,27 @@ export function SettingsPanel({
   const [phPass, setPhPass] = useState("");
   const [phToken, setPhToken] = useState("");
   const [phTls, setPhTls] = useState(true);
+  const [phStatusLine, setPhStatusLine] = useState<string | null>(null);
+  const [phStatusOk, setPhStatusOk] = useState<boolean | null>(null);
+  const [netProxy, setNetProxy] = useState<"none" | "caddy" | "traefik">("none");
+  const [netAdminApi, setNetAdminApi] = useState(false);
+  const [netAdminUrl, setNetAdminUrl] = useState(
+    "http://host.docker.internal:2019",
+  );
+  const [netCaddyfile, setNetCaddyfile] = useState(false);
+  const [netCaddyfilePath, setNetCaddyfilePath] = useState("/config/Caddyfile");
+  const [netLabels, setNetLabels] = useState(true);
+  const [netTls, setNetTls] = useState(true);
+  const [browseOpen, setBrowseOpen] = useState(false);
+  const [browsePath, setBrowsePath] = useState("/");
+  const [browseParent, setBrowseParent] = useState<string | null>(null);
+  const [browseEntries, setBrowseEntries] = useState<FileBrowseEntry[]>([]);
+  const [browseRoots, setBrowseRoots] = useState<
+    Array<{ name: string; path: string }>
+  >([]);
+  const [browseNote, setBrowseNote] = useState<string | null>(null);
+  const [browseError, setBrowseError] = useState<string | null>(null);
+  const [browseBusy, setBrowseBusy] = useState(false);
   const [digKey, setDigKey] = useState("");
   const [digProfiles, setDigProfiles] = useState<
     Array<{
@@ -157,6 +184,8 @@ export function SettingsPanel({
     const wanted = (initialTab || "").toLowerCase();
     if (wanted === "plex") setTab("plex");
     else if (wanted === "pihole") setTab("pihole");
+    else if (wanted === "networking" || wanted === "network" || wanted === "caddy")
+      setTab("networking");
     else if (wanted === "disks") setTab("disks");
     else if (wanted === "host") setTab("host");
     else if (wanted === "email" || wanted === "digest") setTab("email");
@@ -193,6 +222,42 @@ export function SettingsPanel({
         setPhTls(s.pihole.verify_tls);
         setPhPass("");
         setPhToken("");
+        if (s.pihole.configured) {
+          const n = s.pihole.record_count;
+          const ver = s.pihole.detected_version || s.pihole.version;
+          if (s.pihole.ok === false) {
+            setPhStatusOk(false);
+            setPhStatusLine(s.pihole.message || "Last poll failed");
+          } else if (typeof n === "number") {
+            setPhStatusOk(true);
+            setPhStatusLine(
+              `Last poll · ${n} records${ver ? ` (v${ver})` : ""}${
+                s.pihole.message ? ` — ${s.pihole.message}` : ""
+              }`,
+            );
+          } else {
+            setPhStatusOk(null);
+            setPhStatusLine(null);
+          }
+        } else {
+          setPhStatusOk(null);
+          setPhStatusLine(null);
+        }
+        const np = (s.networking?.proxy_type || "none") as
+          | "none"
+          | "caddy"
+          | "traefik";
+        setNetProxy(np === "caddy" || np === "traefik" ? np : "none");
+        setNetAdminApi(Boolean(s.networking?.caddy_use_admin_api));
+        setNetAdminUrl(
+          s.networking?.caddy_admin_url || "http://host.docker.internal:2019",
+        );
+        setNetCaddyfile(Boolean(s.networking?.caddy_use_caddyfile));
+        setNetCaddyfilePath(
+          s.networking?.caddy_caddyfile_path || "/config/Caddyfile",
+        );
+        setNetLabels(s.networking?.caddy_use_labels !== false);
+        setNetTls(s.networking?.verify_tls !== false);
         setDigKey("");
         const rawProfiles =
           s.digest.profiles && s.digest.profiles.length > 0
@@ -303,6 +368,10 @@ export function SettingsPanel({
     return () => window.clearTimeout(id);
   }, [toast]);
 
+  useEffect(() => {
+    if (tab !== "networking") setBrowseOpen(false);
+  }, [tab]);
+
   useScrollLock(Boolean(open && !asPage));
 
   if (!open && !asPage) return null;
@@ -327,6 +396,84 @@ export function SettingsPanel({
     setSelectedDisks((prev) =>
       prev.includes(path) ? prev.filter((p) => p !== path) : [...prev, path],
     );
+  }
+
+  async function loadBrowse(path: string) {
+    setBrowseBusy(true);
+    setBrowseError(null);
+    try {
+      const data = await fetchFileBrowse(path);
+      setBrowsePath(data.path || path || "/");
+      setBrowseParent(data.parent ?? null);
+      setBrowseEntries(data.entries || []);
+      setBrowseRoots(data.roots || [{ name: "Host /", path: "/" }]);
+      setBrowseNote(data.note || null);
+      if (!data.ok) {
+        setBrowseError(data.error || "Cannot browse that path.");
+      }
+    } catch (e) {
+      setBrowseError(e instanceof Error ? e.message : String(e));
+      setBrowseEntries([]);
+    } finally {
+      setBrowseBusy(false);
+    }
+  }
+
+  function openCaddyBrowse() {
+    setBrowseOpen(true);
+    let start = "/";
+    const p = (netCaddyfilePath || "").trim();
+    if (p.startsWith("/") && !p.startsWith("/config")) {
+      const parent = p.replace(/\/[^/]+$/, "");
+      start = parent || "/";
+    }
+    void loadBrowse(start);
+  }
+
+  async function selectCaddyBrowseFile(filePath: string) {
+    setNetCaddyfile(true);
+    setNetCaddyfilePath(filePath);
+    setBrowseOpen(false);
+    setBusy(true);
+    setError(null);
+    try {
+      await putSettings("networking", {
+        proxy_type: netProxy,
+        caddy_use_admin_api: netAdminApi,
+        caddy_admin_url: netAdminUrl,
+        caddy_use_caddyfile: true,
+        caddy_caddyfile_path: filePath,
+        caddy_use_labels: netLabels,
+        verify_tls: netTls,
+      });
+      onSaved();
+      const s = await fetchSettings();
+      setData(s);
+      const r = await testNetworking();
+      setToast(
+        r.ok
+          ? `Saved · ${r.route_count ?? 0} routes`
+          : `Saved · ${r.message || "Test found no routes"}`,
+      );
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function browseCrumbs(path: string): Array<{ label: string; path: string }> {
+    if (!path || path === "/") return [{ label: "/", path: "/" }];
+    const parts = path.split("/").filter(Boolean);
+    const out: Array<{ label: string; path: string }> = [
+      { label: "/", path: "/" },
+    ];
+    let cur = "";
+    for (const part of parts) {
+      cur += `/${part}`;
+      out.push({ label: part, path: cur });
+    }
+    return out;
   }
 
   const body = (
@@ -461,7 +608,15 @@ export function SettingsPanel({
 
         {tab === "pihole" ? (
           <section>
-            <p className="helper">Optional — badges containers with matching DNS.</p>
+            <p className="helper">
+              Optional — reads Local DNS (A) + CNAME from Pi-hole. It’s normal
+              every name points at your Caddy IP; pair with Settings →
+              Networking for real routing.
+            </p>
+            <p className="helper">
+              URL: host is enough. v5 uses the API token; v6 uses the web or
+              app password. Leave Version on auto unless Test fails.
+            </p>
             <label className="field">
               Pi-hole URL
               <input
@@ -479,7 +634,8 @@ export function SettingsPanel({
               </select>
             </label>
             <label className="field">
-              Password / app password{data?.pihole.has_password ? " · set" : ""}
+              Password / app password (v6)
+              {data?.pihole.has_password ? " · set" : ""}
               <input
                 type="password"
                 autoComplete="new-password"
@@ -506,6 +662,21 @@ export function SettingsPanel({
               />
               Verify TLS
             </label>
+            {phStatusLine ? (
+              <p
+                className="helper"
+                style={{
+                  color:
+                    phStatusOk === false
+                      ? "var(--danger, #b00020)"
+                      : phStatusOk === true
+                        ? "var(--ok, inherit)"
+                        : undefined,
+                }}
+              >
+                {phStatusLine}
+              </p>
+            ) : null}
             <div className="detail-actions">
               <button
                 type="button"
@@ -533,9 +704,285 @@ export function SettingsPanel({
                     setBusy(true);
                     try {
                       const r = await testPihole();
+                      const count = r.record_count ?? 0;
+                      const line = r.ok
+                        ? `${r.message || `OK — ${count} records`}${
+                            r.version ? ` (v${r.version})` : ""
+                          }`
+                        : r.message || "Failed";
+                      // False zeros (bad token / no list API) come back ok=false
+                      setPhStatusOk(Boolean(r.ok));
+                      setPhStatusLine(line);
+                      setToast(line);
+                    } catch (e) {
+                      const msg = e instanceof Error ? e.message : String(e);
+                      setPhStatusOk(false);
+                      setPhStatusLine(msg);
+                      setError(msg);
+                    } finally {
+                      setBusy(false);
+                    }
+                  })()
+                }
+              >
+                Test
+              </button>
+              <Link to="/dns" className="btn">
+                View Local DNS
+              </Link>
+            </div>
+          </section>
+        ) : null}
+
+        {tab === "networking" ? (
+          <section>
+            <p className="helper">
+              DNS often points every name at one IP. The reverse proxy maps
+              hostname → upstream container/port. Read-only.
+            </p>
+            <label className="field">
+              Proxy type
+              <select
+                value={netProxy}
+                onChange={(e) =>
+                  setNetProxy(e.target.value as "none" | "caddy" | "traefik")
+                }
+              >
+                <option value="none">None</option>
+                <option value="caddy">Caddy</option>
+                <option value="traefik">Traefik (coming soon)</option>
+              </select>
+            </label>
+
+            {netProxy === "traefik" ? (
+              <p className="helper">
+                Traefik discovery isn’t implemented yet — choose Caddy, or keep
+                Pi-hole hostname matching only.
+              </p>
+            ) : null}
+
+            {netProxy === "caddy" ? (
+              <>
+                <p className="helper" style={{ marginTop: "0.75rem" }}>
+                  Enable one or more discovery methods:
+                </p>
+                <label className="check-row">
+                  <input
+                    type="checkbox"
+                    checked={netAdminApi}
+                    onChange={(e) => setNetAdminApi(e.target.checked)}
+                  />
+                  Caddy Admin API
+                </label>
+                {netAdminApi ? (
+                  <label className="field">
+                    Admin API URL
+                    <input
+                      placeholder="http://host.docker.internal:2019"
+                      value={netAdminUrl}
+                      onChange={(e) => setNetAdminUrl(e.target.value)}
+                    />
+                  </label>
+                ) : null}
+                <p className="helper">
+                  Keep admin on LAN only — never expose :2019 publicly.
+                </p>
+                <label className="check-row">
+                  <input
+                    type="checkbox"
+                    checked={netCaddyfile}
+                    onChange={(e) => setNetCaddyfile(e.target.checked)}
+                  />
+                  Caddyfile path
+                </label>
+                {netCaddyfile || browseOpen ? (
+                  <div className="field">
+                    Host path (or /config mount)
+                    <div className="path-browse-row">
+                      <input
+                        placeholder="/etc/caddy/Caddyfile"
+                        value={netCaddyfilePath}
+                        onChange={(e) => setNetCaddyfilePath(e.target.value)}
+                      />
+                      <button
+                        type="button"
+                        className="btn"
+                        disabled={busy || browseBusy}
+                        onClick={() => openCaddyBrowse()}
+                      >
+                        Browse
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="detail-actions" style={{ marginBottom: "0.5rem" }}>
+                    <button
+                      type="button"
+                      className="btn"
+                      disabled={busy || browseBusy}
+                      onClick={() => openCaddyBrowse()}
+                    >
+                      Browse for Caddyfile
+                    </button>
+                  </div>
+                )}
+                {browseOpen ? (
+                  <div className="file-browse" aria-label="Browse host files">
+                    <div className="file-browse-head">
+                      <p className="helper" style={{ margin: 0 }}>
+                        {browseNote ||
+                          "Read-only under the host mount (HOST_ROOT)."}
+                      </p>
+                      <button
+                        type="button"
+                        className="btn"
+                        onClick={() => setBrowseOpen(false)}
+                      >
+                        Close
+                      </button>
+                    </div>
+                    {browseRoots.length > 1 ? (
+                      <div className="file-browse-roots">
+                        {browseRoots.map((r) => (
+                          <button
+                            key={r.path}
+                            type="button"
+                            className={
+                              browsePath === r.path
+                                ? "file-browse-root active"
+                                : "file-browse-root"
+                            }
+                            disabled={browseBusy}
+                            onClick={() => void loadBrowse(r.path)}
+                          >
+                            {r.name}
+                          </button>
+                        ))}
+                      </div>
+                    ) : null}
+                    <nav className="file-browse-crumbs" aria-label="Path">
+                      {browseCrumbs(browsePath).map((c, i, arr) => (
+                        <span key={c.path} className="file-browse-crumb">
+                          {i > 0 ? (
+                            <span className="file-browse-sep">/</span>
+                          ) : null}
+                          <button
+                            type="button"
+                            className="file-browse-crumb-btn"
+                            disabled={browseBusy || i === arr.length - 1}
+                            onClick={() => void loadBrowse(c.path)}
+                          >
+                            {c.label}
+                          </button>
+                        </span>
+                      ))}
+                    </nav>
+                    {browseParent ? (
+                      <button
+                        type="button"
+                        className="file-browse-item"
+                        disabled={browseBusy}
+                        onClick={() => void loadBrowse(browseParent)}
+                      >
+                        <span className="file-browse-kind">up</span>
+                        <span>..</span>
+                      </button>
+                    ) : null}
+                    {browseBusy ? (
+                      <div className="empty">Loading…</div>
+                    ) : browseError ? (
+                      <div className="error-inline">{browseError}</div>
+                    ) : !browseEntries.length ? (
+                      <div className="empty">Empty folder.</div>
+                    ) : (
+                      <ul className="file-browse-list">
+                        {browseEntries.map((e) => (
+                          <li key={e.path}>
+                            <button
+                              type="button"
+                              className={
+                                e.likely
+                                  ? "file-browse-item likely"
+                                  : "file-browse-item"
+                              }
+                              disabled={busy || browseBusy}
+                              onClick={() => {
+                                if (e.type === "dir") {
+                                  void loadBrowse(e.path);
+                                } else {
+                                  void selectCaddyBrowseFile(e.path);
+                                }
+                              }}
+                            >
+                              <span className="file-browse-kind">
+                                {e.type === "dir" ? "dir" : "file"}
+                              </span>
+                              <span className="file-browse-name">{e.name}</span>
+                              {e.likely ? (
+                                <span className="file-browse-tag">likely</span>
+                              ) : null}
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                ) : null}
+                <p className="helper">
+                  Browse mounted host disks (same /host mount as Disks), or type
+                  a path. Selecting a file saves it and enables Caddyfile
+                  discovery — works alongside Admin API / labels.
+                </p>
+                <label className="check-row">
+                  <input
+                    type="checkbox"
+                    checked={netLabels}
+                    onChange={(e) => setNetLabels(e.target.checked)}
+                  />
+                  caddy-docker-proxy labels
+                </label>
+                <label className="check-row">
+                  <input
+                    type="checkbox"
+                    checked={netTls}
+                    onChange={(e) => setNetTls(e.target.checked)}
+                  />
+                  Verify TLS (Admin API)
+                </label>
+              </>
+            ) : null}
+
+            <div className="detail-actions">
+              <button
+                type="button"
+                className="btn btn-primary"
+                disabled={busy}
+                onClick={() => {
+                  void save("networking", {
+                    proxy_type: netProxy,
+                    caddy_use_admin_api: netAdminApi,
+                    caddy_admin_url: netAdminUrl,
+                    caddy_use_caddyfile: netCaddyfile,
+                    caddy_caddyfile_path: netCaddyfilePath,
+                    caddy_use_labels: netLabels,
+                    verify_tls: netTls,
+                  });
+                }}
+              >
+                Save Networking
+              </button>
+              <button
+                type="button"
+                className="btn"
+                disabled={busy || netProxy === "none"}
+                onClick={() =>
+                  void (async () => {
+                    setBusy(true);
+                    try {
+                      const r = await testNetworking();
                       setToast(
                         r.ok
-                          ? `OK · ${r.record_count ?? 0} records`
+                          ? `OK · ${r.route_count ?? 0} routes`
                           : r.message || "Failed",
                       );
                     } catch (e) {
@@ -1147,7 +1594,8 @@ export function SettingsPanel({
         {tab === "host" ? (
           <section>
             <p className="helper">
-              Host page extras — listening ports and optional Internet speed.
+              Host page extras — open ports (host listeners + Docker published)
+              and optional Internet speed.
             </p>
             <label className="check-row">
               <input
@@ -1155,11 +1603,13 @@ export function SettingsPanel({
                 checked={portsEnabled}
                 onChange={(e) => setPortsEnabled(e.target.checked)}
               />
-              Show listening ports on Host
+              Show open ports on Host
             </label>
             <p className="helper">
-              Inventory of sockets already listening (host /proc via /:/host:ro) —
-              not a network scan.
+              When on, shows both host machine listeners (via /:/host:ro →
+              HOST_PROC=/host/proc, host PID 1 netns) and Docker published host
+              bindings from inspect — not a network scan, and not Dockerfile
+              EXPOSE alone.
             </p>
 
             <h4 className="settings-subhead">Internet speed</h4>

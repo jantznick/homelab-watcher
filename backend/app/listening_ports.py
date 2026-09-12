@@ -1,4 +1,12 @@
-"""Inventory of host listening sockets (read-only; not a network scanner)."""
+"""Inventory of host listening sockets (read-only; not a network scanner).
+
+Reads the *host* network namespace via ``{HOST_PROC}/1/net/{tcp,…}`` when
+``/:/host:ro`` is mounted (Compose ``HOST_PROC=/host/proc``).
+
+Important: ``{HOST_PROC}/net/tcp`` is *not* reliable from inside a container —
+Linux ``/proc/net`` follows the reader's netns, so that path often shows only
+the Watcher container's own listeners. We never treat that as the host view.
+"""
 
 from __future__ import annotations
 
@@ -13,6 +21,13 @@ logger = logging.getLogger(__name__)
 
 _TCP_LISTEN = 0x0A
 _CONTAINER_ID_RE = re.compile(r"(?:docker[-/]|cri-containerd-)([0-9a-f]{12,64})")
+
+# Short honest copy when host netns sockets are unavailable.
+_NOTE_MOUNT = (
+    "Host listening ports need /:/host:ro and HOST_PROC=/host/proc "
+    "(reads host PID 1 netns)."
+)
+_NOTE_LIMITED = "Host listening ports unavailable — container-local view only."
 
 
 def _hex_port(part: str) -> int | None:
@@ -78,7 +93,7 @@ def _classify_bind(addr: str, family: str) -> str:
 
 
 def _parse_proc_net(path: Path, *, family: str, proto: str) -> list[dict[str, Any]]:
-    """Parse /proc/net/{tcp,tcp6,udp,udp6} into listening rows."""
+    """Parse /proc/.../net/{tcp,tcp6,udp,udp6} into listening rows."""
     out: list[dict[str, Any]] = []
     try:
         text = path.read_text(errors="replace")
@@ -144,6 +159,71 @@ def _parse_proc_net(path: Path, *, family: str, proto: str) -> list[dict[str, An
             }
         )
     return out
+
+
+def _file_fingerprint(path: Path) -> tuple[int, int] | None:
+    """Size + mtime_ns fingerprint to compare proc net tables without parsing."""
+    try:
+        st = path.stat()
+        return (int(st.st_size), int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))))
+    except OSError:
+        return None
+
+
+def _same_net_table(a: Path, b: Path) -> bool:
+    """True when two tcp tables look identical (same netns view)."""
+    fa, fb = _file_fingerprint(a), _file_fingerprint(b)
+    if fa is None or fb is None:
+        return False
+    if fa == fb:
+        return True
+    try:
+        return a.read_bytes() == b.read_bytes()
+    except OSError:
+        return False
+
+
+def _resolve_host_net_dir(host_proc: Path) -> tuple[Path | None, str | None]:
+    """
+    Locate a ``…/net`` directory for the *host* network namespace.
+
+    Prefer ``{HOST_PROC}/1/net`` (host PID 1). Reject ``{HOST_PROC}/net`` when it
+    matches this process's ``/proc/self/net`` (container-local view).
+    """
+    self_tcp = Path("/proc/self/net/tcp")
+    pid1_net = host_proc / "1" / "net"
+    pid1_tcp = pid1_net / "tcp"
+
+    if pid1_tcp.is_file():
+        # If PID 1's table matches our own, we are likely on the host already
+        # (bare metal / host network mode) — still valid host listeners.
+        return pid1_net, None
+
+    # Bare-metal / local venv: HOST_PROC often is /proc and /proc/1/net may be
+    # unreadable; /proc/net is fine *only* when it is not a foreign container
+    # mount that still mirrors self.
+    generic_net = host_proc / "net"
+    generic_tcp = generic_net / "tcp"
+    if not generic_tcp.is_file():
+        return None, _NOTE_MOUNT
+
+    if self_tcp.is_file() and _same_net_table(generic_tcp, self_tcp):
+        # Same table as this process — only OK when host_proc is the real /proc
+        # (we are not in an isolated container netns, or we *are* the host).
+        # Inside Docker without host PID 1 access this is misleading — refuse.
+        dockerenv = Path("/.dockerenv").exists()
+        in_container_cgroup = False
+        try:
+            cg = Path("/proc/self/cgroup").read_text(errors="replace")
+            in_container_cgroup = "docker" in cg or "containerd" in cg or "kubepods" in cg
+        except OSError:
+            pass
+        if dockerenv or in_container_cgroup:
+            return None, _NOTE_LIMITED
+        return generic_net, None
+
+    # Different from self — treat as host view (unusual layouts).
+    return generic_net, None
 
 
 def _inode_to_pid(host_proc: Path) -> dict[int, int]:
@@ -235,58 +315,6 @@ def _docker_name_map(containers: list[dict[str, Any]] | None) -> dict[str, str]:
     return out
 
 
-def _from_psutil() -> list[dict[str, Any]]:
-    """Fallback when host /proc/net is missing (e.g. macOS local venv)."""
-    try:
-        import socket
-
-        import psutil
-    except Exception:
-        return []
-
-    rows: list[dict[str, Any]] = []
-    try:
-        conns = psutil.net_connections(kind="inet")
-    except Exception as exc:
-        logger.warning("psutil.net_connections failed: %s", exc)
-        return []
-
-    for c in conns:
-        if getattr(c, "status", None) != "LISTEN":
-            continue
-        if not c.laddr:
-            continue
-        addr = getattr(c.laddr, "ip", None) or (c.laddr[0] if c.laddr else "")
-        port = getattr(c.laddr, "port", None) or (
-            c.laddr[1] if len(c.laddr) > 1 else None
-        )
-        if port is None:
-            continue
-        proto = "udp" if c.type == socket.SOCK_DGRAM else "tcp"
-        family = "ipv6" if c.family == socket.AF_INET6 else "ipv4"
-        scope = _classify_bind(str(addr), "tcp6" if family == "ipv6" else "tcp4")
-        process = None
-        if c.pid:
-            try:
-                process = psutil.Process(c.pid).name()
-            except Exception:
-                process = None
-        rows.append(
-            {
-                "protocol": proto,
-                "family": family,
-                "port": int(port),
-                "address": str(addr),
-                "bind_scope": scope,
-                "inode": None,
-                "pid": c.pid,
-                "process": process,
-                "container": None,
-            }
-        )
-    return rows
-
-
 def _dedupe_sort(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     seen: set[tuple[Any, ...]] = set()
     out: list[dict[str, Any]] = []
@@ -316,11 +344,12 @@ def collect_listening_ports(
     containers: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """
-    Discover listening TCP (and UDP) sockets on the host view.
+    Discover listening TCP/UDP sockets on the **host** network namespace.
 
-    Prefer HOST_PROC /proc/net + fd→inode attribution when available
-    (Compose /:/host:ro → HOST_PROC=/host/proc). Falls back to psutil.
-    Never raises — returns empty list + note on failure.
+    Uses ``{HOST_PROC}/1/net/*`` (Compose ``HOST_PROC=/host/proc`` with
+    ``/:/host:ro``). Never silently returns container-local listeners as host
+    ports — when the host netns is unavailable, returns an empty list and a
+    short note.
     """
     settings = get_settings()
     host_proc = Path(settings.host_proc)
@@ -329,46 +358,44 @@ def collect_listening_ports(
     rows: list[dict[str, Any]] = []
 
     try:
-        tcp = host_proc / "net" / "tcp"
-        if tcp.is_file():
-            source = "host_proc"
-            for fname, family, proto in (
-                ("tcp", "tcp4", "tcp"),
-                ("tcp6", "tcp6", "tcp"),
-                ("udp", "udp4", "udp"),
-                ("udp6", "udp6", "udp"),
-            ):
-                p = host_proc / "net" / fname
-                if p.is_file():
-                    rows.extend(_parse_proc_net(p, family=family, proto=proto))
-
-            inode_map = _inode_to_pid(host_proc) if rows else {}
-            docker_names = _docker_name_map(containers) if rows else {}
-            for r in rows:
-                inode = r.get("inode")
-                pid = inode_map.get(inode) if inode else None
-                if pid:
-                    r["pid"] = pid
-                    r["process"] = _read_cmdline(host_proc, pid) or _read_comm(
-                        host_proc, pid
-                    )
-                    cid = _container_id_for_pid(host_proc, pid)
-                    if cid:
-                        r["container"] = docker_names.get(cid) or cid
+        if not host_proc.is_dir():
+            notes.append(_NOTE_MOUNT)
         else:
-            rows = _from_psutil()
-            if rows:
-                source = "local"
-                notes.append(
-                    "Limited view — ports from this process only."
-                )
+            net_dir, resolve_note = _resolve_host_net_dir(host_proc)
+            if net_dir is None:
+                notes.append(resolve_note or _NOTE_MOUNT)
             else:
-                notes.append(
-                    "Open ports unavailable without a host mount."
-                )
+                tcp = net_dir / "tcp"
+                if not tcp.is_file():
+                    notes.append(_NOTE_MOUNT)
+                else:
+                    source = "host_proc"
+                    for fname, family, proto in (
+                        ("tcp", "tcp4", "tcp"),
+                        ("tcp6", "tcp6", "tcp"),
+                        ("udp", "udp4", "udp"),
+                        ("udp6", "udp6", "udp"),
+                    ):
+                        p = net_dir / fname
+                        if p.is_file():
+                            rows.extend(_parse_proc_net(p, family=family, proto=proto))
+
+                    inode_map = _inode_to_pid(host_proc) if rows else {}
+                    docker_names = _docker_name_map(containers) if rows else {}
+                    for r in rows:
+                        inode = r.get("inode")
+                        pid = inode_map.get(inode) if inode else None
+                        if pid:
+                            r["pid"] = pid
+                            r["process"] = _read_cmdline(host_proc, pid) or _read_comm(
+                                host_proc, pid
+                            )
+                            cid = _container_id_for_pid(host_proc, pid)
+                            if cid:
+                                r["container"] = docker_names.get(cid) or cid
     except Exception as exc:
         logger.warning("Listening ports collection failed: %s", exc)
-        notes.append("Open ports unavailable on this host view.")
+        notes.append("Host listening ports unavailable.")
         rows = []
         source = "none"
 

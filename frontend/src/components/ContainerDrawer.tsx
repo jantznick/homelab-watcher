@@ -373,16 +373,71 @@ export function ContainerDrawer({
                   </dd>
                 </div>
               ) : null}
-              {container.pihole_matched ? (
-                <div className="detail-row">
-                  <dt>Pi-hole DNS</dt>
-                  <dd className="mono wrap">
-                    {(container.pihole_hostnames || []).join(", ")}
-                  </dd>
-                </div>
-              ) : null}
             </dl>
           </section>
+
+          <section className="drawer-section">
+            <h3 className="drawer-section-title">Domains</h3>
+            {(() => {
+              const entries = container.networking?.entries || [];
+              const seen = new Set(
+                entries.map((e) => (e.hostname || "").toLowerCase().replace(/\.$/, "")),
+              );
+              const dnsOnly = (container.pihole_hostnames || []).filter((h) => {
+                const n = h.toLowerCase().replace(/\.$/, "");
+                return n && !seen.has(n);
+              });
+              if (!entries.length && !dnsOnly.length) {
+                return <div className="quiet">—</div>;
+              }
+              return (
+                <ul className="domains-list">
+                  {entries.map((e, i) => (
+                    <li key={`net-${e.hostname}-${e.upstream}-${i}`}>
+                      <span className="mono">{e.upstream || "—"}</span>
+                      <span className="quiet"> → </span>
+                      <span className="mono wrap">{e.hostname}</span>
+                      {e.in_dns ? (
+                        <span className="badge-dns" title="In Pi-hole Local DNS">
+                          DNS
+                        </span>
+                      ) : null}
+                    </li>
+                  ))}
+                  {dnsOnly.map((h) => (
+                    <li key={`dns-${h}`}>
+                      <span className="quiet">—</span>
+                      <span className="quiet"> → </span>
+                      <span className="mono wrap">{h}</span>
+                      <span className="badge-dns" title="In Pi-hole Local DNS">
+                        DNS
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              );
+            })()}
+          </section>
+
+          {container.networking?.mapped &&
+          (container.networking.entries || []).length > 0 ? (
+            <section className="drawer-section">
+              <h3 className="drawer-section-title">Networking</h3>
+              <ul className="networking-list">
+                {(container.networking.entries || []).map((e, i) => (
+                  <li key={`${e.hostname}-${e.upstream}-${i}`}>
+                    <span className="mono">{e.hostname}</span>
+                    <span className="quiet">
+                      {" "}
+                      → via {e.proxy || "proxy"}
+                      {e.source ? ` (${e.source})` : ""} →{" "}
+                    </span>
+                    <span className="mono">{e.upstream || "—"}</span>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          ) : null}
 
           <section className="drawer-section">
             <h3 className="drawer-section-title">Compose</h3>

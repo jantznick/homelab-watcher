@@ -120,6 +120,23 @@ export function ContainersPanel({
     setScope(scopeFromSearch(searchParams));
   }, [searchParams]);
 
+  useEffect(() => {
+    const openName = (searchParams.get("open") || "").trim();
+    if (!openName || !items.length) return;
+    const match = items.find(
+      (c) =>
+        c.name === openName ||
+        c.container_id === openName ||
+        (c.container_id && openName.startsWith(c.container_id)),
+    );
+    if (!match) return;
+    setModalStep("detail");
+    setSelected(match);
+    const next = new URLSearchParams(searchParams);
+    next.delete("open");
+    setSearchParams(next, { replace: true });
+  }, [items, searchParams, setSearchParams]);
+
   function openDetail(c: ContainerItem) {
     setModalStep("detail");
     setSelected(c);
@@ -166,6 +183,8 @@ export function ContainersPanel({
         c.status,
         c.access_url || "",
         ...(c.pihole_hostnames || []),
+        ...((c.networking?.entries || []).map((e) => e.hostname)),
+        ...((c.networking?.entries || []).map((e) => e.upstream)),
       ]
         .join(" ")
         .toLowerCase();
@@ -176,6 +195,13 @@ export function ContainersPanel({
   const piholeNote = (() => {
     if (!pihole || !pihole.configured) return null;
     if (pihole.ok === false) return pihole.message || "Pi-hole unreachable";
+    const n = pihole.record_count ?? 0;
+    if (n === 0) {
+      return (
+        pihole.message ||
+        "Pi-hole connected but 0 local DNS records — check Settings → Pi-hole Test"
+      );
+    }
     return null;
   })();
 
@@ -220,6 +246,20 @@ export function ContainersPanel({
             title={(c.pihole_hostnames || []).join(", ")}
           >
             DNS
+          </span>
+        ) : null}
+        {c.proxy_matched || c.networking?.mapped ? (
+          <span
+            className="badge-proxy"
+            title={(c.networking?.entries || [])
+              .map((e) =>
+                e.upstream
+                  ? `${e.hostname} → ${e.upstream}`
+                  : e.hostname,
+              )
+              .join("\n")}
+          >
+            proxy
           </span>
         ) : null}
       </>

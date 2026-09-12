@@ -397,18 +397,32 @@ def _ipv6_by_iface(path: Path) -> dict[str, list[str]]:
 
 def _collect_network_summary() -> dict[str, Any]:
     """
-    Compact host NIC / IP summary. Prefer HOST_PROC when mounted; else psutil.
+    Compact host NIC / IP summary. Prefer host PID 1 netns under HOST_PROC;
+    else psutil (explicitly labeled as container/local view).
     """
     settings = get_settings()
     host_proc = Path(settings.host_proc)
     interfaces: list[dict[str, Any]] = []
 
-    if (host_proc / "net" / "dev").is_file():
-        names = _ifaces_from_proc_dev(host_proc / "net" / "dev")
-        v6 = _ipv6_by_iface(host_proc / "net" / "if_inet6") if (host_proc / "net" / "if_inet6").is_file() else {}
+    # Prefer host PID 1 netns — {HOST_PROC}/net often mirrors the container.
+    net_dir = host_proc / "1" / "net"
+    if not (net_dir / "dev").is_file():
+        net_dir = host_proc / "net"
+        # Inside Docker, generic /host/proc/net is usually the container view.
+        if Path("/.dockerenv").exists() and (net_dir / "dev").is_file():
+            # Fall through to psutil with an honest note rather than fake host NICs.
+            net_dir = Path("__none__")
+
+    if (net_dir / "dev").is_file():
+        names = _ifaces_from_proc_dev(net_dir / "dev")
+        v6 = (
+            _ipv6_by_iface(net_dir / "if_inet6")
+            if (net_dir / "if_inet6").is_file()
+            else {}
+        )
         v4 = (
-            _ipv4_from_fib_trie(host_proc / "net" / "fib_trie")
-            if (host_proc / "net" / "fib_trie").is_file()
+            _ipv4_from_fib_trie(net_dir / "fib_trie")
+            if (net_dir / "fib_trie").is_file()
             else []
         )
         # Attach IPv4s to first non-virtual iface when we can't map precisely.
@@ -575,14 +589,49 @@ def collect_host_metrics(
         **net,
     }
 
-    # Listening ports — fail-soft, optional via Settings.
+    # Open ports — host listeners + Docker published bindings (fail-soft).
     try:
+        from app.docker_client import collect_docker_published_ports
         from app.listening_ports import collect_listening_ports
 
         ports_cfg = getattr(yaml_cfg, "listening_ports", None)
         enabled = True if ports_cfg is None else bool(ports_cfg.enabled)
         if enabled:
-            out.update(collect_listening_ports(containers=containers))
+            host_ports = collect_listening_ports(containers=containers)
+            docker_ports = collect_docker_published_ports(containers)
+            # Correlate: annotate host listeners that match a *live* Docker publish.
+            # Stopped containers keep configured PortBindings in the inventory, but
+            # they must not tag real host listeners.
+            pub_by_port: dict[tuple[str, int], list[str]] = {}
+            for d in docker_ports.get("docker_published_ports") or []:
+                state = str(d.get("container_state") or "").lower()
+                if state and state not in ("running", "restarting", "paused"):
+                    continue
+                try:
+                    hp = int(d.get("host_port"))
+                except (TypeError, ValueError):
+                    continue
+                proto = str(d.get("protocol") or "tcp").lower()
+                name = str(d.get("container") or "").strip()
+                if not name:
+                    continue
+                pub_by_port.setdefault((proto, hp), [])
+                if name not in pub_by_port[(proto, hp)]:
+                    pub_by_port[(proto, hp)].append(name)
+            for r in host_ports.get("listening_ports") or []:
+                try:
+                    port = int(r.get("port"))
+                except (TypeError, ValueError):
+                    continue
+                proto = str(r.get("protocol") or "tcp").lower()
+                matches = pub_by_port.get((proto, port)) or []
+                if matches:
+                    r["docker_published"] = matches
+                    # Prefer naming the Docker publish when cgroup attribution is empty.
+                    if not r.get("container") and len(matches) == 1:
+                        r["container"] = matches[0]
+            out.update(host_ports)
+            out.update(docker_ports)
         else:
             out.update(
                 {
@@ -591,6 +640,10 @@ def collect_host_metrics(
                     "listening_ports_note": None,
                     "listening_ports_exposed_count": 0,
                     "listening_ports_enabled": False,
+                    "docker_published_ports": [],
+                    "docker_published_ports_count": 0,
+                    "docker_published_ports_exposed_count": 0,
+                    "docker_published_ports_note": None,
                 }
             )
     except Exception as exc:
@@ -599,9 +652,13 @@ def collect_host_metrics(
             {
                 "listening_ports": [],
                 "listening_ports_source": "none",
-                "listening_ports_note": "Open ports unavailable on this host view.",
+                "listening_ports_note": "Host listening ports unavailable.",
                 "listening_ports_exposed_count": 0,
                 "listening_ports_enabled": True,
+                "docker_published_ports": [],
+                "docker_published_ports_count": 0,
+                "docker_published_ports_exposed_count": 0,
+                "docker_published_ports_note": None,
             }
         )
 

@@ -17,6 +17,16 @@ pihole:
   version: auto
   verify_tls: true
 
+# Optional reverse-proxy mapping (prefer Settings → Networking).
+# DNS names often all point at one IP; Caddy maps hostname → upstream.
+# networking:
+#   proxy_type: caddy   # none | caddy | traefik
+#   caddy_use_admin_api: false
+#   caddy_admin_url: http://host.docker.internal:2019
+#   caddy_use_caddyfile: true
+#   caddy_caddyfile_path: /config/Caddyfile
+#   caddy_use_labels: true
+
 thresholds:
   disk_warn_percent: 85
   # Mounts to monitor (empty = none). Prefer Settings → Disks checkboxes.

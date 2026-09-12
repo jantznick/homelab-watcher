@@ -41,6 +41,24 @@ class PiHoleConfig(BaseModel):
     timeout_seconds: float = 5.0
 
 
+class NetworkingConfig(BaseModel):
+    """
+    Optional reverse-proxy route discovery for DNS → proxy → container mapping.
+    Prefer Settings → Networking. Read-only against Caddy (and later Traefik).
+    """
+
+    # none | caddy | traefik
+    proxy_type: Literal["none", "caddy", "traefik"] = "none"
+    # Caddy discovery methods (one or more when proxy_type=caddy)
+    caddy_use_admin_api: bool = False
+    caddy_admin_url: str = "http://host.docker.internal:2019"
+    caddy_use_caddyfile: bool = False
+    caddy_caddyfile_path: str = "/config/Caddyfile"
+    caddy_use_labels: bool = True
+    verify_tls: bool = True
+    timeout_seconds: float = 5.0
+
+
 class TrivyConfig(BaseModel):
     """Image SCA via Trivy. Requires `trivy` on PATH (installed in the app image)."""
 
@@ -102,8 +120,9 @@ class SecurityConfig(BaseModel):
 
 class ListeningPortsConfig(BaseModel):
     """
-    Host listening-socket inventory (read-only /proc or psutil).
-    Not a port scanner — lists sockets already listening on the host view.
+    Open-ports inventory on the Host page: host machine listeners
+    (host /proc netns via HOST_PROC) plus Docker published host bindings.
+    Not a port scanner. When enabled, both sources are shown.
     """
 
     enabled: bool = True
@@ -130,6 +149,7 @@ class AppYamlConfig(BaseModel):
     # Optional Pi-hole API; secrets via PIHOLE_PASSWORD / PIHOLE_API_TOKEN in .env
     # Prefer Settings UI / SQLite when configured there (see runtime_settings).
     pihole: PiHoleConfig = Field(default_factory=PiHoleConfig)
+    networking: NetworkingConfig = Field(default_factory=NetworkingConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     listening_ports: ListeningPortsConfig = Field(default_factory=ListeningPortsConfig)
     speed_test: SpeedTestConfig = Field(default_factory=SpeedTestConfig)

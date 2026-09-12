@@ -1,6 +1,6 @@
 # Homelab Watcher
 
-A small dashboard for a **single Docker host**. It shows live containers (with optional security checks), host CPU/RAM/disk/uptime/load, listening-port inventory, optional Internet speed checks, optional HTTP/ping/DNS checks (Plex, custom targets), and quiet email digests when something needs attention.
+A small dashboard for a **single Docker host**. It shows live containers (with optional security checks), host CPU/RAM/disk/uptime/load, open-port inventory (host listeners via host `/proc` + Docker published bindings), optional Internet speed checks, optional HTTP/ping/DNS checks (Plex, custom targets), and quiet email digests when something needs attention.
 
 Configure most things in the **web Settings** UI (saved to SQLite). `.env` / `config.yaml` are optional fallbacks for first boot.
 
@@ -47,7 +47,7 @@ docker compose up -d --build
 | Mount | Purpose |
 |-------|---------|
 | `docker.sock` (**writable**) | Inventory + optional update/restart/tear-down/reclaim. Use `:ro` only if you disable actions in Settings → General. |
-| `/:/host:ro` | Host metrics, disk paths under `/mnt/...`, and listening-port inventory (`HOST_PROC` → `/proc/net`). Also remaps Compose `working_dir` / config file paths for Update (see below). |
+| `/:/host:ro` | Host metrics, disk paths under `/mnt/...`, and **host** listening ports (`HOST_PROC=/host/proc` → reads **host PID 1** netns at `/host/proc/1/net/*`, not the Watcher container’s `/proc/net`). Also remaps Compose `working_dir` / config file paths for Update (see below). |
 | Optional same-path stacks mount | e.g. `/home/user/stacks:/home/user/stacks:ro` if you prefer not relying on `/host` remapping |
 | `./config.yaml` | Optional YAML fallback |
 | `watcher-data` | SQLite DB, Trivy cache, SCM clone cache, settings/secrets |
@@ -87,7 +87,7 @@ docker compose up -d --build
 - **Pi-hole** — URL, version, password (v6) / API token (v5), with where-to-click directions.
 - **Email digests** — What digests are, enable/schedule/from/to/Resend key, all-clear toggle, what counts as notable, test send.
 - **Security** — Trivy image SCA, OpenSCA SCM dependency scans, posture checks; intervals; severity thresholds.
-- **Host** — Listening-port inventory toggle; optional Internet speed check (Cloudflare public endpoints, no API key) with interval or Run now.
+- **Host** — Open ports toggle (host machine listeners + Docker published host bindings; default both when on); optional Internet speed check (Cloudflare public endpoints, no API key) with interval or Run now.
 - **Disks** — Paths to monitor; warn percent.
 
 ---
@@ -175,6 +175,17 @@ Quiet summary on a cron — not alert spam. Notable includes: starred container 
 
 For laptop testing. **Production is Compose on the home server.**
 
+### One-command backend
+
+From the repo root (backend only — does not start Vite):
+
+```bash
+./dev.sh
+# or: bash dev.sh
+```
+
+Creates `backend/.venv` (Python 3.12) if needed, installs requirements, copies `config.example.yaml` → `config.yaml` when missing, sets `DATABASE_PATH` / `CONFIG_PATH` (and Colima `DOCKER_HOST` when that socket exists), then runs uvicorn on **http://127.0.0.1:8080**. Start the frontend separately with `cd frontend && npm run dev` if you want the UI.
+
 ### Python version (required)
 
 Local backend needs **Python 3.12 or 3.13** — same family as the image (`python:3.12-slim` in the Dockerfile). Prefer **3.12** so laptop and Compose stay aligned.
@@ -244,7 +255,7 @@ Trivy and OpenSCA are optional locally; install them yourself or expect “scan 
 | Update/lifecycle/tear-down fail with permission | Socket mounted `:ro` — use writable sock or disable actions |
 | HTTPS check down, container up | Caddy / certs / Authentik — not the app container |
 | Scans slow / pending | First Trivy DB download + image scan, or first SCM clone/OpenSCA; cached afterward |
-| Pi-hole no badges | URL/credentials in Settings; check version v5 vs v6 |
+| Pi-hole no badges / 0 records | Settings → Pi-hole → **Test**. **v5** (web ≥ 5.11): API token + `GET /admin/api.php?customdns&action=get&auth=TOKEN` (and `customcname`). Bare `[]` = wrong token or web &lt; 5.11 (no list API) — not empty DNS. **v6**: password/app password + `/api/config/dns/hosts`. URL: `http://<pi-ip>` (optional `/admin`). |
 | Digests not sending | Resend key + To in Settings; check enabled + cron/TZ |
 | `pip install` fails building `pydantic-core` / PyO3; or `uvicorn: command not found` | Venv created with **Python 3.14+**. PyO3 in the pinned stack maxes out at 3.13, so install aborts and `uvicorn` never lands. See recovery steps below. |
 

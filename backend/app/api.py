@@ -32,10 +32,12 @@ from app.runtime_settings import (
     digest_public_view,
     effective_yaml_overlay,
     get_speed_test_last,
+    networking_public_view,
     pihole_public_view,
     plex_as_target,
     resolve_general,
     resolve_listening_ports,
+    resolve_networking,
     resolve_pihole,
     resolve_plex,
     resolve_security,
@@ -48,6 +50,8 @@ from app.runtime_settings import (
 )
 from app.docker_client import get_container_logs, get_docker_error
 from app.scheduler import (
+    get_last_dns,
+    get_last_networking,
     get_last_pihole,
     get_poll_status,
     poll_once,
@@ -116,6 +120,9 @@ def _container_item(r: dict[str, Any]) -> dict[str, Any]:
         "access_url_source": raw.get("access_url_source"),
         "pihole_matched": bool(raw.get("pihole_matched")),
         "pihole_hostnames": raw.get("pihole_hostnames") or [],
+        "proxy_matched": bool(raw.get("proxy_matched")),
+        "networking": raw.get("networking")
+        or {"mapped": False, "entries": []},
         "watched": bool(raw.get("watched", raw.get("vital"))),
         "watched_key": raw.get("watched_key") or raw.get("vital_key"),
         # One-release dual-read aliases (prefer watched / watched_key).
@@ -243,14 +250,31 @@ def containers() -> dict[str, Any]:
         "message": "Pi-hole not configured",
         "record_count": 0,
     }
+    networking = get_last_networking() or {
+        "proxy_type": "none",
+        "configured": False,
+        "ok": None,
+        "route_count": 0,
+        "mapped_count": 0,
+        "message": None,
+        "errors": [],
+        "sources_tried": [],
+    }
     return {
         "items": items,
         "taken_at": items[0]["taken_at"] if items else None,
         "pihole": pihole,
+        "networking": networking,
         "actions_enabled": actions_enabled(),
         "docker_available": get_docker_error() is None,
         "docker_error": get_docker_error(),
     }
+
+
+@router.get("/dns")
+def dns_records() -> dict[str, Any]:
+    """Local DNS inventory from last poll (Pi-hole + Caddy/container join)."""
+    return get_last_dns()
 
 
 # ----- per-container description / notes (before /containers/{id}) -----
@@ -452,6 +476,16 @@ def host() -> dict[str, Any]:
         "listening_ports_note": raw.get("listening_ports_note"),
         "listening_ports_exposed_count": raw.get("listening_ports_exposed_count"),
         "listening_ports_enabled": raw.get("listening_ports_enabled"),
+        "docker_published_ports": (
+            raw["docker_published_ports"]
+            if isinstance(raw.get("docker_published_ports"), list)
+            else []
+        ),
+        "docker_published_ports_count": raw.get("docker_published_ports_count"),
+        "docker_published_ports_exposed_count": raw.get(
+            "docker_published_ports_exposed_count"
+        ),
+        "docker_published_ports_note": raw.get("docker_published_ports_note"),
         "speed_test": speed,
     }
 
@@ -795,6 +829,7 @@ def get_all_settings() -> dict[str, Any]:
             "source": tsrc,
         },
         "pihole": pihole_public_view(),
+        "networking": networking_public_view(),
         "digest": digest_public_view(),
         "security": security_public_view(security, ssrc),
         "listening_ports": {
@@ -994,7 +1029,11 @@ def put_pihole(body: PiHoleSettingsBody) -> dict[str, Any]:
 
 @router.post("/settings/pihole/test")
 def test_pihole() -> dict[str, Any]:
-    """Fetch DNS records with saved credentials — confirms discovery works."""
+    """Fetch DNS records with saved credentials — confirms discovery works.
+
+    Always returns a clear message: record count on success, or why it failed.
+    Never a silent zero without explanation.
+    """
     cfg, password, token, _src = resolve_pihole()
     if not (cfg.url or "").strip():
         return {
@@ -1002,17 +1041,133 @@ def test_pihole() -> dict[str, Any]:
             "configured": False,
             "message": "Set a Pi-hole URL and save first.",
             "record_count": 0,
+            "version": None,
+        }
+    if not (password or "").strip() and not (token or "").strip():
+        return {
+            "ok": False,
+            "configured": True,
+            "message": "Save a password (v6) or API token (v5) first.",
+            "record_count": 0,
+            "version": cfg.version,
         }
     result = fetch_pihole_dns(
         cfg, password_override=password, token_override=token
     )
+    count = len(result.records)
+    if result.ok:
+        msg = result.message or (
+            f"OK — {count} local/custom DNS records"
+            if count
+            else (
+                "Connected — 0 Local DNS records "
+                "(API list empty; not an auth/endpoint failure)"
+            )
+        )
+    else:
+        msg = result.message or "Failed to fetch Pi-hole DNS records"
     return {
         "ok": bool(result.ok),
         "configured": bool(result.configured),
         "version": result.version,
-        "message": result.message
-        or (f"OK — {len(result.records)} local/custom DNS records" if result.ok else "Failed"),
-        "record_count": len(result.records),
+        "message": msg,
+        "record_count": count,
+    }
+
+
+class NetworkingSettingsBody(BaseModel):
+    proxy_type: str = "none"
+    caddy_use_admin_api: bool = False
+    caddy_admin_url: str = "http://host.docker.internal:2019"
+    caddy_use_caddyfile: bool = False
+    caddy_caddyfile_path: str = "/config/Caddyfile"
+    caddy_use_labels: bool = True
+    verify_tls: bool = True
+    timeout_seconds: float = 5.0
+
+
+@router.put("/settings/networking")
+def put_networking(body: NetworkingSettingsBody) -> dict[str, Any]:
+    proxy = (body.proxy_type or "none").lower().strip()
+    if proxy not in ("none", "caddy", "traefik"):
+        proxy = "none"
+    data = {
+        "proxy_type": proxy,
+        "caddy_use_admin_api": bool(body.caddy_use_admin_api),
+        "caddy_admin_url": (body.caddy_admin_url or "").strip()
+        or "http://host.docker.internal:2019",
+        "caddy_use_caddyfile": bool(body.caddy_use_caddyfile),
+        "caddy_caddyfile_path": (body.caddy_caddyfile_path or "").strip()
+        or "/config/Caddyfile",
+        "caddy_use_labels": bool(body.caddy_use_labels),
+        "verify_tls": bool(body.verify_tls),
+        "timeout_seconds": float(body.timeout_seconds or 5.0),
+    }
+    db.set_setting("networking", data)
+    return {"ok": True, "networking": networking_public_view()}
+
+
+@router.post("/settings/networking/test")
+def test_networking() -> dict[str, Any]:
+    """Discover proxy routes with saved settings — read-only."""
+    from app.docker_client import list_containers
+    from app.networking import discover_and_enrich
+
+    cfg, _ = resolve_networking()
+    if cfg.proxy_type == "none":
+        return {
+            "ok": False,
+            "configured": False,
+            "message": "Set proxy type to Caddy (or Traefik) and save first.",
+            "route_count": 0,
+            "mapped_count": 0,
+            "errors": [],
+            "sources_tried": [],
+        }
+    if cfg.proxy_type == "traefik":
+        return {
+            "ok": False,
+            "configured": True,
+            "message": "Traefik route discovery is coming soon.",
+            "route_count": 0,
+            "mapped_count": 0,
+            "errors": [],
+            "sources_tried": [],
+            "proxy_type": "traefik",
+        }
+    try:
+        containers = list_containers()
+    except Exception:
+        containers = []
+    status = discover_and_enrich(
+        containers,
+        proxy_type=cfg.proxy_type,
+        use_admin_api=cfg.caddy_use_admin_api,
+        admin_url=cfg.caddy_admin_url,
+        use_caddyfile=cfg.caddy_use_caddyfile,
+        caddyfile_path=cfg.caddy_caddyfile_path,
+        use_labels=cfg.caddy_use_labels,
+        verify_tls=cfg.verify_tls,
+        timeout=cfg.timeout_seconds,
+        pihole=None,
+    )
+    ok = bool(status.get("ok")) and int(status.get("route_count") or 0) > 0
+    if status.get("ok") and int(status.get("route_count") or 0) == 0:
+        ok = False
+    msg = status.get("message")
+    if ok:
+        msg = f"OK — {status.get('route_count', 0)} routes discovered"
+    elif status.get("errors"):
+        msg = "; ".join(status.get("errors") or [])
+    return {
+        "ok": ok,
+        "configured": bool(status.get("configured")),
+        "proxy_type": status.get("proxy_type"),
+        "message": msg or "Failed",
+        "route_count": int(status.get("route_count") or 0),
+        "mapped_count": int(status.get("mapped_count") or 0),
+        "errors": status.get("errors") or [],
+        "sources_tried": status.get("sources_tried") or [],
     }
 
 
@@ -1029,6 +1184,18 @@ def disks_discover() -> dict[str, Any]:
         "disk_warn_percent": thresholds.disk_warn_percent,
         "host_root_mounted": host_root_available(),
     }
+
+
+@router.get("/files/browse")
+def files_browse(path: str = "/") -> dict[str, Any]:
+    """
+    Read-only directory listing under HOST_ROOT (same mount as disk discover).
+
+    ``path`` is a host path (e.g. /etc/caddy). Cannot escape the host mount.
+    """
+    from app.file_browse import browse_host_path
+
+    return browse_host_path(path)
 
 
 @router.get("/settings/disks")
@@ -1343,6 +1510,7 @@ def config_targets() -> dict[str, Any]:
         "thresholds": cfg.thresholds.model_dump(),
         "container_urls": dict(cfg.container_urls),
         "pihole": pihole_public_view(),
+        "networking": networking_public_view(),
         "security": cfg.security.model_dump(),
         "listening_ports": cfg.listening_ports.model_dump(),
         "speed_test": cfg.speed_test.model_dump(),

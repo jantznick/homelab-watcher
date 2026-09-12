@@ -13,10 +13,10 @@ from app import db
 from app.access_urls import enrich_container_access
 from app.checks import run_all_checks
 from app.config import get_settings
-from app.container_enrich import correlate_pihole
 from app.digest import run_scheduled_digest
 from app.docker_client import get_docker_error, get_docker_endpoint, get_docker_status, list_containers
 from app.host_metrics import collect_host_metrics
+from app.networking import build_dns_inventory, discover_and_enrich
 from app.pihole import fetch_pihole_dns
 from app.runtime_settings import (
     apply_watched,
@@ -24,6 +24,7 @@ from app.runtime_settings import (
     effective_yaml_overlay,
     get_speed_test_last,
     resolve_digest_settings,
+    resolve_networking,
     resolve_pihole,
     resolve_speed_test,
     save_speed_test_last,
@@ -38,6 +39,8 @@ scheduler = BackgroundScheduler()
 _last_poll_at: str | None = None
 _last_poll_error: str | None = None
 _last_pihole: dict | None = None
+_last_networking: dict | None = None
+_last_dns_records: list | None = None
 
 
 def get_poll_status() -> dict:
@@ -47,6 +50,7 @@ def get_poll_status() -> dict:
         "last_poll_error": _last_poll_error,
         "poll_interval_seconds": effective_poll_interval(),
         "pihole": _last_pihole,
+        "networking": _last_networking,
         "docker_available": docker_error is None and get_docker_endpoint() is not None,
         "docker_error": docker_error,
         "docker_endpoint": get_docker_endpoint(),
@@ -58,8 +62,40 @@ def get_last_pihole() -> dict | None:
     return _last_pihole
 
 
+def get_last_networking() -> dict | None:
+    return _last_networking
+
+
+def get_last_dns() -> dict:
+    """Snapshot for GET /api/dns — Local DNS rows + Pi-hole / networking status."""
+    return {
+        "taken_at": _last_poll_at,
+        "pihole": _last_pihole
+        or {
+            "configured": False,
+            "ok": None,
+            "version": None,
+            "message": "Pi-hole not configured",
+            "record_count": 0,
+        },
+        "networking": _last_networking
+        or {
+            "proxy_type": "none",
+            "configured": False,
+            "ok": None,
+            "route_count": 0,
+            "mapped_count": 0,
+            "message": None,
+            "errors": [],
+            "sources_tried": [],
+        },
+        "records": list(_last_dns_records or []),
+    }
+
+
 def poll_once() -> None:
-    global _last_poll_at, _last_poll_error, _last_pihole
+    global _last_poll_at, _last_poll_error, _last_pihole, _last_networking
+    global _last_dns_records
     try:
         yaml_cfg = effective_yaml_overlay()
         containers = list_containers()
@@ -72,16 +108,23 @@ def poll_once() -> None:
         except Exception as exc:
             logger.warning("Security enrichment skipped: %s", exc)
 
+        pihole_result = None
         try:
             ph_cfg, password, token, _src = resolve_pihole()
-            pihole = fetch_pihole_dns(
+            pihole_result = fetch_pihole_dns(
                 ph_cfg,
                 password_override=password,
                 token_override=token,
             )
-            _last_pihole = correlate_pihole(containers, pihole)
+            _last_pihole = {
+                "configured": pihole_result.configured,
+                "ok": pihole_result.ok if pihole_result.configured else None,
+                "version": pihole_result.version,
+                "message": pihole_result.message,
+                "record_count": len(pihole_result.records),
+            }
         except Exception as exc:
-            logger.warning("Pi-hole enrichment skipped: %s", exc)
+            logger.warning("Pi-hole fetch skipped: %s", exc)
             _last_pihole = {
                 "configured": bool((resolve_pihole()[0].url or "").strip()),
                 "ok": False,
@@ -92,6 +135,49 @@ def poll_once() -> None:
             for c in containers:
                 c.setdefault("pihole_matched", False)
                 c.setdefault("pihole_hostnames", [])
+
+        try:
+            net_cfg, _ = resolve_networking()
+            _last_networking = discover_and_enrich(
+                containers,
+                proxy_type=net_cfg.proxy_type,
+                use_admin_api=net_cfg.caddy_use_admin_api,
+                admin_url=net_cfg.caddy_admin_url,
+                use_caddyfile=net_cfg.caddy_use_caddyfile,
+                caddyfile_path=net_cfg.caddy_caddyfile_path,
+                use_labels=net_cfg.caddy_use_labels,
+                verify_tls=net_cfg.verify_tls,
+                timeout=net_cfg.timeout_seconds,
+                pihole=pihole_result,
+            )
+            # Refresh pihole status record_count / matched after join
+            if pihole_result is not None:
+                _last_pihole = {
+                    "configured": pihole_result.configured,
+                    "ok": pihole_result.ok if pihole_result.configured else None,
+                    "version": pihole_result.version,
+                    "message": pihole_result.message,
+                    "record_count": len(pihole_result.records),
+                }
+            _last_dns_records = build_dns_inventory(containers, pihole_result)
+        except Exception as exc:
+            logger.warning("Networking enrichment skipped: %s", exc)
+            _last_networking = {
+                "proxy_type": "none",
+                "configured": False,
+                "ok": False,
+                "route_count": 0,
+                "mapped_count": 0,
+                "message": str(exc),
+                "errors": [str(exc)],
+                "sources_tried": [],
+            }
+            # Hostname-only fallback
+            if pihole_result is not None:
+                from app.container_enrich import correlate_pihole
+
+                _last_pihole = correlate_pihole(containers, pihole_result)
+            _last_dns_records = build_dns_inventory(containers, pihole_result)
 
         db.save_container_snapshots(containers)
 

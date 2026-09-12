@@ -81,6 +81,17 @@ export type ContainerItem = {
   access_url_source: string | null;
   pihole_matched: boolean;
   pihole_hostnames: string[];
+  proxy_matched?: boolean;
+  networking?: {
+    mapped: boolean;
+    entries: Array<{
+      hostname: string;
+      upstream: string;
+      source: string;
+      proxy?: string;
+      in_dns?: boolean;
+    }>;
+  };
   /** Starred / important container (digest when down). */
   watched?: boolean;
   watched_key?: string | null;
@@ -105,12 +116,44 @@ export type ContainerItem = {
   };
 };
 
+export type NetworkingStatus = {
+  proxy_type?: string;
+  configured?: boolean;
+  ok?: boolean | null;
+  route_count?: number;
+  mapped_count?: number;
+  message?: string | null;
+  errors?: string[];
+  sources_tried?: string[];
+};
+
 export type PiHoleStatus = {
   configured: boolean;
   ok: boolean | null;
   version: string | null;
   message: string | null;
   record_count: number;
+};
+
+export type DnsRecordRow = {
+  hostname: string;
+  type: string;
+  target: string;
+  /** Upstream listen/proxy port from Caddy when joined. */
+  port?: number | null;
+  container?: string | null;
+  container_id?: string | null;
+  container_state?: string | null;
+  upstream?: string | null;
+  route_source?: string | null;
+  proxy?: string | null;
+};
+
+export type DnsInventoryPayload = {
+  taken_at: string | null;
+  pihole: PiHoleStatus;
+  networking?: NetworkingStatus | null;
+  records: DnsRecordRow[];
 };
 
 export type DiskMetric = {
@@ -135,6 +178,20 @@ export type ListeningPort = {
   pid?: number | null;
   process?: string | null;
   container?: string | null;
+  /** Container names whose Docker publish matches this host port. */
+  docker_published?: string[] | null;
+};
+
+export type DockerPublishedPort = {
+  host_ip: string;
+  host_port: number;
+  container_port: number;
+  protocol: string;
+  bind_scope: "all" | "lan" | "localhost" | string;
+  mapping?: string;
+  container?: string | null;
+  container_id?: string | null;
+  container_state?: string | null;
 };
 
 export type HostNetworkInterface = {
@@ -182,6 +239,10 @@ export type HostMetrics = {
   listening_ports_note?: string | null;
   listening_ports_exposed_count?: number | null;
   listening_ports_enabled?: boolean | null;
+  docker_published_ports?: DockerPublishedPort[];
+  docker_published_ports_count?: number | null;
+  docker_published_ports_exposed_count?: number | null;
+  docker_published_ports_note?: string | null;
   speed_test?: SpeedTestInfo | null;
   metrics?: null;
 };
@@ -324,6 +385,23 @@ export type SettingsPayload = {
     has_api_token: boolean;
     password_in_db: boolean;
     api_token_in_db: boolean;
+    /** Last poll status (from scheduler), when available */
+    ok?: boolean | null;
+    message?: string | null;
+    record_count?: number | null;
+    detected_version?: string | null;
+  };
+  networking?: {
+    source: string;
+    configured: boolean;
+    proxy_type: string;
+    caddy_use_admin_api: boolean;
+    caddy_admin_url: string;
+    caddy_use_caddyfile: boolean;
+    caddy_caddyfile_path: string;
+    caddy_use_labels: boolean;
+    verify_tls: boolean;
+    timeout_seconds: number;
   };
   digest: {
     source: string;
@@ -415,10 +493,15 @@ export function fetchContainers() {
     items: ContainerItem[];
     taken_at: string | null;
     pihole: PiHoleStatus;
+    networking?: NetworkingStatus | null;
     actions_enabled: boolean;
     docker_available?: boolean;
     docker_error?: string | null;
   }>("/api/containers");
+}
+
+export function fetchDns() {
+  return getJson<DnsInventoryPayload>("/api/dns");
 }
 
 export function fetchHost() {
@@ -495,6 +578,42 @@ export function testPihole() {
     message?: string;
     record_count?: number;
   }>("/api/settings/pihole/test", { method: "POST" });
+}
+
+export function testNetworking() {
+  return getJson<{
+    ok: boolean;
+    configured?: boolean;
+    proxy_type?: string;
+    message?: string;
+    route_count?: number;
+    mapped_count?: number;
+    errors?: string[];
+    sources_tried?: string[];
+  }>("/api/settings/networking/test", { method: "POST" });
+}
+
+export type FileBrowseEntry = {
+  name: string;
+  type: "dir" | "file";
+  path: string;
+  likely?: boolean;
+};
+
+export function fetchFileBrowse(path = "/") {
+  const q = `?path=${encodeURIComponent(path)}`;
+  return getJson<{
+    ok: boolean;
+    path: string;
+    parent: string | null;
+    host_root: string;
+    host_root_mounted: boolean;
+    read_only: boolean;
+    entries: FileBrowseEntry[];
+    roots: Array<{ name: string; path: string }>;
+    note?: string | null;
+    error?: string | null;
+  }>(`/api/files/browse${q}`);
 }
 
 export function setWatched(body: {

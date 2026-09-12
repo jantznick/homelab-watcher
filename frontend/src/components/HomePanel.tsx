@@ -4,6 +4,7 @@ import type {
   ContainerItem,
   DiskMetric,
   DockerDiskUsage,
+  DockerPublishedPort,
   ListeningPort,
   PiHoleStatus,
   SpeedTestInfo,
@@ -104,13 +105,18 @@ function routeForItem(id: string): string {
     case "security":
       return "/containers?scope=issues";
     case "disks":
+      return "/host/disks";
     case "ports":
+      return "/host/network";
     case "docker-disk":
-      return "/host";
+      return "/host/docker";
     case "disks-select":
       return "/settings/disks";
     case "pihole":
-      return "/settings/pihole";
+      return "/dns";
+    case "networking":
+    case "caddy":
+      return "/settings/networking";
     case "plex":
       return "/settings/plex";
     case "checks":
@@ -139,6 +145,7 @@ export function HomePanel({
   dockerDisk,
   listeningPorts,
   listeningPortsEnabled,
+  dockerPublishedPorts,
   cpu,
   mem,
   memUsed,
@@ -160,6 +167,7 @@ export function HomePanel({
   dockerDisk?: DockerDiskUsage | null;
   listeningPorts?: ListeningPort[];
   listeningPortsEnabled?: boolean | null;
+  dockerPublishedPorts?: DockerPublishedPort[];
   cpu?: number | null;
   mem?: number | null;
   memUsed?: number | null;
@@ -184,10 +192,19 @@ export function HomePanel({
   const plex = checks.find((c) => c.name.trim().toLowerCase() === "plex");
   const plexIssue = plex && !plex.ok;
   const portsOn = listeningPortsEnabled !== false;
-  const exposedPorts = (listeningPorts || []).filter(
+  const exposedHost = (listeningPorts || []).filter(
     (p) => p.bind_scope === "all" || p.bind_scope === "lan",
   );
-  const allBound = exposedPorts.some((p) => p.bind_scope === "all");
+  // Live Docker publishes only — stopped configs are not currently open.
+  const exposedDocker = (dockerPublishedPorts || []).filter((p) => {
+    if (p.bind_scope !== "all" && p.bind_scope !== "lan") return false;
+    const st = (p.container_state || "").toLowerCase();
+    return !st || st === "running" || st === "restarting" || st === "paused";
+  });
+  const exposedPortsCount = exposedHost.length + exposedDocker.length;
+  const allBound =
+    exposedHost.some((p) => p.bind_scope === "all") ||
+    exposedDocker.some((p) => p.bind_scope === "all");
 
   let critCount = 0;
   let highCount = 0;
@@ -232,7 +249,7 @@ export function HomePanel({
       label: diskSelectionNeeded ? "Disks" : "Disks warn",
       value: diskSelectionNeeded ? "—" : diskWarns.length,
       tone: diskSelectionNeeded || diskWarns.length ? "warn" : "ok",
-      to: diskSelectionNeeded ? "/settings/disks" : "/host",
+      to: diskSelectionNeeded ? "/settings/disks" : "/host/disks",
     },
   ];
 
@@ -243,7 +260,7 @@ export function HomePanel({
       label: "Docker reclaimable",
       value: formatBytes(reclaim),
       tone: reclaim >= 5 * 1024 ** 3 ? "warn" : reclaim > 0 ? "muted" : "ok",
-      to: "/host#docker-disk",
+      to: "/host/docker",
     });
   }
 
@@ -251,9 +268,9 @@ export function HomePanel({
     metrics.push({
       id: "ports",
       label: "LAN ports",
-      value: exposedPorts.length,
-      tone: allBound ? "warn" : exposedPorts.length ? "muted" : "ok",
-      to: "/host",
+      value: exposedPortsCount,
+      tone: allBound ? "warn" : exposedPortsCount ? "muted" : "ok",
+      to: "/host/network",
     });
   }
 
@@ -335,17 +352,31 @@ export function HomePanel({
   }
 
   if (portsOn) {
+    const detailParts: string[] = [];
+    if (exposedHost.length) {
+      detailParts.push(
+        `host ${exposedHost
+          .slice(0, 3)
+          .map((p) => `${p.protocol}/${p.port}`)
+          .join(", ")}${exposedHost.length > 3 ? "…" : ""}`,
+      );
+    }
+    if (exposedDocker.length) {
+      detailParts.push(
+        `docker ${exposedDocker
+          .slice(0, 3)
+          .map((p) => `${p.host_port}→${p.container || "?"}`)
+          .join(", ")}${exposedDocker.length > 3 ? "…" : ""}`,
+      );
+    }
     items.push({
       id: "ports",
       title: "LAN-exposed ports",
-      count: exposedPorts.length,
+      count: exposedPortsCount,
       detail:
-        exposedPorts.length === 0
+        exposedPortsCount === 0
           ? "None"
-          : exposedPorts
-              .slice(0, 5)
-              .map((p) => `${p.protocol}/${p.port}`)
-              .join(", ") + (exposedPorts.length > 5 ? "…" : ""),
+          : detailParts.join(" · ") || `${exposedPortsCount} open`,
       tone: allBound ? "warn" : "ok",
       to: routeForItem("ports"),
     });
@@ -441,7 +472,7 @@ export function HomePanel({
       key: "pihole",
       label: "Pi-hole",
       ok: pihole.ok,
-      to: "/settings/pihole",
+      to: pihole.ok === false ? "/settings/pihole" : "/dns",
     });
   }
   for (const c of checks) {
@@ -542,7 +573,7 @@ export function HomePanel({
           <div className="panel-head">
             <h2>Host</h2>
             <div className="meta">
-              <Link to="/host" className="home-meta-link">
+              <Link to="/host/system" className="home-meta-link">
                 {hostWaiting
                   ? "Collecting…"
                   : hostAt
@@ -624,7 +655,7 @@ export function HomePanel({
                   return (
                     <Link
                       key={`${d.filesystem || ""}:${mount}`}
-                      to="/host"
+                      to="/host/disks"
                       className="home-disk-row"
                     >
                       <div className="meter-label">
@@ -653,14 +684,14 @@ export function HomePanel({
                 })
               )}
               {disks.length > 4 ? (
-                <Link to="/host" className="home-meta-link">
+                <Link to="/host/disks" className="home-meta-link">
                   +{disks.length - 4} more
                 </Link>
               ) : null}
             </div>
           </div>
           <div className="home-host-extras">
-            <Link to="/host" className="home-host-extra">
+            <Link to="/host/system" className="home-host-extra">
               <span className="home-host-extra-label">Uptime</span>
               <span className="mono">
                 {hostWaiting && uptimeSeconds == null
@@ -668,7 +699,7 @@ export function HomePanel({
                   : formatUptime(uptimeSeconds)}
               </span>
             </Link>
-            <Link to="/host" className="home-host-extra">
+            <Link to="/host/network" className="home-host-extra">
               <span className="home-host-extra-label">Speed</span>
               <span className="mono">
                 {speedTest?.busy

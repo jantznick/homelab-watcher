@@ -107,7 +107,7 @@ Keep them **opt-in Settings cards** with test buttons (same pattern as Plex / Pi
 ### High fit
 
 - **Authentik / Authelia / Pocket ID** — document “put Watcher behind SSO”; optional “SSO health” HTTP check template. Don’t build an IdP.
-- **Caddy** — already read site labels for access URLs; optional admin API: cert expiry, upstream unhealthy.
+- **Caddy / Networking** — Settings → Networking maps DNS → Caddy routes → containers (Admin API / Caddyfile / labels). Traefik still TODO. Cert expiry / upstream health still open.
 - **Cloudflare** — Tunnel status / last seen; zone cert expiry; reuse Cloudflare for speed (already).
 - **UPS (NUT)** — on-battery → Home warn + digest.
 - **SMART** — `smartctl` on selected disks (Wear_Leveling, Reallocated) via host mount / privileged sidecar — careful with privileges.

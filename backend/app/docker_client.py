@@ -229,24 +229,184 @@ def _slim_inspect(attrs: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _published_ports(attrs: dict[str, Any]) -> list[str]:
-    """Human-readable published ports like ``0.0.0.0:8080->80/tcp``."""
-    ports = ((attrs.get("NetworkSettings") or {}).get("Ports") or {}) or {}
-    lines: list[str] = []
-    for cport, bindings in sorted(ports.items(), key=lambda x: str(x[0])):
+def _parse_container_port_key(cport: str) -> tuple[int | None, str]:
+    """Parse ``80/tcp`` → (80, ``tcp``)."""
+    raw = str(cport or "").strip().lower()
+    if "/" in raw:
+        port_s, proto = raw.split("/", 1)
+    else:
+        port_s, proto = raw, "tcp"
+    proto = (proto or "tcp").strip() or "tcp"
+    try:
+        return int(port_s), proto
+    except ValueError:
+        return None, proto
+
+
+def _classify_host_bind(host_ip: str) -> str:
+    a = (host_ip or "").lower().strip() or "0.0.0.0"
+    if a in ("0.0.0.0", "*", "::", "::0"):
+        return "all"
+    if a in ("127.0.0.1", "::1") or a.startswith("127."):
+        return "localhost"
+    return "lan"
+
+
+def _published_port_bindings(attrs: dict[str, Any]) -> list[dict[str, Any]]:
+    """
+    Structured host-published bindings from NetworkSettings.Ports
+    (and HostConfig.PortBindings as a fallback).
+
+    Only rows with a real host port — not bare Dockerfile EXPOSE.
+    """
+    ns_ports = ((attrs.get("NetworkSettings") or {}).get("Ports") or {}) or {}
+    hc_bindings = ((attrs.get("HostConfig") or {}).get("PortBindings") or {}) or {}
+
+    # Prefer live NetworkSettings.Ports; fall back to configured PortBindings.
+    keys = sorted(set(str(k) for k in ns_ports.keys()) | set(str(k) for k in hc_bindings.keys()))
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+
+    for cport_key in keys:
+        cport, proto = _parse_container_port_key(cport_key)
+        if cport is None:
+            continue
+        bindings = ns_ports.get(cport_key)
         if not bindings:
-            lines.append(str(cport))
+            bindings = hc_bindings.get(cport_key)
+        if not bindings:
+            continue
+        if not isinstance(bindings, list):
             continue
         for b in bindings:
             if not isinstance(b, dict):
                 continue
             hip = (b.get("HostIp") or "0.0.0.0").strip() or "0.0.0.0"
-            hport = str(b.get("HostPort") or "").strip()
-            if hport:
-                lines.append(f"{hip}:{hport}->{cport}")
-            else:
-                lines.append(str(cport))
+            hport_s = str(b.get("HostPort") or "").strip()
+            if not hport_s:
+                continue
+            try:
+                hport = int(hport_s)
+            except ValueError:
+                continue
+            key = (hip, hport, cport, proto)
+            if key in seen:
+                continue
+            seen.add(key)
+            scope = _classify_host_bind(hip)
+            rows.append(
+                {
+                    "host_ip": hip,
+                    "host_port": hport,
+                    "container_port": cport,
+                    "protocol": proto,
+                    "bind_scope": scope,
+                    "mapping": f"{hip}:{hport}->{cport}/{proto}",
+                }
+            )
+    return rows
+
+
+def _published_ports(attrs: dict[str, Any]) -> list[str]:
+    """Human-readable published ports like ``0.0.0.0:8080->80/tcp``."""
+    rows = _published_port_bindings(attrs)
+    if rows:
+        return [str(r["mapping"]) for r in rows]
+    # Preserve prior behavior: show EXPOSE-only keys when nothing is published.
+    ports = ((attrs.get("NetworkSettings") or {}).get("Ports") or {}) or {}
+    lines: list[str] = []
+    for cport, bindings in sorted(ports.items(), key=lambda x: str(x[0])):
+        if not bindings:
+            lines.append(str(cport))
     return lines
+
+
+def collect_docker_published_ports(
+    containers: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """
+    Flatten published host bindings across the container inventory
+    (running and stopped/exited).
+
+    Source: inspect NetworkSettings.Ports / HostConfig.PortBindings already
+    summarized on each container (and re-parsed from inspect when present).
+    For stopped containers, configured PortBindings are included when present;
+    live NetworkSettings.Ports are preferred when the container is running.
+    """
+    rows: list[dict[str, Any]] = []
+    if not containers:
+        return {
+            "docker_published_ports": [],
+            "docker_published_ports_count": 0,
+            "docker_published_ports_exposed_count": 0,
+            "docker_published_ports_note": None,
+        }
+
+    for c in containers:
+        name = str(c.get("name") or "").lstrip("/") or None
+        cid = str(c.get("container_id") or "") or None
+        state = str(c.get("state") or c.get("status") or "").lower()
+        inspect = c.get("inspect") if isinstance(c.get("inspect"), dict) else None
+        bindings: list[dict[str, Any]] = []
+        if inspect:
+            bindings = _published_port_bindings(inspect)
+        if not bindings:
+            # Fall back to parsing human-readable published_ports strings.
+            for line in c.get("published_ports") or []:
+                text = str(line).strip()
+                if "->" not in text:
+                    continue
+                left, right = text.split("->", 1)
+                left, right = left.strip(), right.strip()
+                hip = "0.0.0.0"
+                hport_s = left
+                if ":" in left:
+                    hip, hport_s = left.rsplit(":", 1)
+                cport, proto = _parse_container_port_key(right)
+                try:
+                    hport = int(hport_s)
+                except ValueError:
+                    continue
+                if cport is None:
+                    continue
+                bindings.append(
+                    {
+                        "host_ip": hip or "0.0.0.0",
+                        "host_port": hport,
+                        "container_port": cport,
+                        "protocol": proto,
+                        "bind_scope": _classify_host_bind(hip or "0.0.0.0"),
+                        "mapping": f"{hip or '0.0.0.0'}:{hport}->{cport}/{proto}",
+                    }
+                )
+        for b in bindings:
+            rows.append(
+                {
+                    **b,
+                    "container": name,
+                    "container_id": cid,
+                    "container_state": state or None,
+                }
+            )
+
+    scope_rank = {"all": 0, "lan": 1, "localhost": 2}
+
+    def sort_key(r: dict[str, Any]) -> tuple:
+        return (
+            scope_rank.get(str(r.get("bind_scope") or ""), 9),
+            str(r.get("protocol") or ""),
+            int(r.get("host_port") or 0),
+            str(r.get("container") or ""),
+        )
+
+    rows.sort(key=sort_key)
+    exposed = sum(1 for r in rows if r.get("bind_scope") in ("all", "lan"))
+    return {
+        "docker_published_ports": rows,
+        "docker_published_ports_count": len(rows),
+        "docker_published_ports_exposed_count": exposed,
+        "docker_published_ports_note": None,
+    }
 
 
 def _networks_list(attrs: dict[str, Any]) -> list[str]:
@@ -351,6 +511,8 @@ def list_containers() -> list[dict[str, Any]]:
                         "access_url_source": None,
                         "pihole_matched": False,
                         "pihole_hostnames": [],
+                        "proxy_matched": False,
+                        "networking": {"mapped": False, "entries": []},
                         "inspect": _slim_inspect(attrs),
                         "compose_project": labels.get("com.docker.compose.project"),
                         "compose_service": labels.get("com.docker.compose.service"),
