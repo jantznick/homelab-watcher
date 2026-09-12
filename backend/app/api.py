@@ -11,6 +11,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from app import db
+from app.caddy_routes import normalize_caddy_env, scan_caddyfile_placeholders
 from app.config import TargetConfig
 from app.container_actions import (
     get_job,
@@ -1102,6 +1103,7 @@ class NetworkingSettingsBody(BaseModel):
     caddy_admin_url: str = "http://host.docker.internal:2019"
     caddy_use_caddyfile: bool = False
     caddy_caddyfile_path: str = "/config/Caddyfile"
+    caddy_env: dict[str, str] | None = None
     caddy_use_labels: bool = True
     verify_tls: bool = True
     timeout_seconds: float = 5.0
@@ -1120,12 +1122,34 @@ def put_networking(body: NetworkingSettingsBody) -> dict[str, Any]:
         "caddy_use_caddyfile": bool(body.caddy_use_caddyfile),
         "caddy_caddyfile_path": (body.caddy_caddyfile_path or "").strip()
         or "/config/Caddyfile",
+        "caddy_env": (
+            normalize_caddy_env(body.caddy_env)
+            if body.caddy_env is not None
+            else normalize_caddy_env(
+                (db.get_setting("networking") or {}).get("caddy_env")
+            )
+        ),
         "caddy_use_labels": bool(body.caddy_use_labels),
         "verify_tls": bool(body.verify_tls),
         "timeout_seconds": float(body.timeout_seconds or 5.0),
     }
     db.set_setting("networking", data)
     return {"ok": True, "networking": networking_public_view()}
+
+
+@router.get("/settings/networking/caddyfile-vars")
+def get_caddyfile_vars(path: str | None = None) -> dict[str, Any]:
+    """Scan a Caddyfile for {$VAR} / {env.VAR} placeholders (read-only)."""
+    cfg, _ = resolve_networking()
+    raw = (path or cfg.caddy_caddyfile_path or "").strip()
+    found, err = scan_caddyfile_placeholders(raw) if raw else ([], "Caddyfile path not set")
+    return {
+        "ok": err is None,
+        "path": raw,
+        "placeholders": [{"name": p.name, "default": p.default} for p in found],
+        "error": err,
+        "values": dict(cfg.caddy_env or {}),
+    }
 
 
 @router.post("/settings/networking/test")
@@ -1168,6 +1192,7 @@ def test_networking() -> dict[str, Any]:
         admin_url=cfg.caddy_admin_url,
         use_caddyfile=cfg.caddy_use_caddyfile,
         caddyfile_path=cfg.caddy_caddyfile_path,
+        caddyfile_env=cfg.caddy_env,
         use_labels=cfg.caddy_use_labels,
         verify_tls=cfg.verify_tls,
         timeout=cfg.timeout_seconds,

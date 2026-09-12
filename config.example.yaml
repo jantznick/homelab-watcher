@@ -25,6 +25,9 @@ pihole:
 #   caddy_admin_url: http://host.docker.internal:2019
 #   caddy_use_caddyfile: true
 #   caddy_caddyfile_path: /config/Caddyfile
+#   # Values for {$VAR} placeholders in that Caddyfile (or set them in Settings)
+#   # caddy_env:
+#   #   MY_DOMAIN: example.com
 #   caddy_use_labels: true
 
 thresholds:

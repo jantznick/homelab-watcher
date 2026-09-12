@@ -417,6 +417,9 @@ export type SettingsPayload = {
     caddy_admin_url: string;
     caddy_use_caddyfile: boolean;
     caddy_caddyfile_path: string;
+    caddy_env?: Record<string, string>;
+    caddy_placeholders?: Array<{ name: string; default?: string | null }>;
+    caddy_placeholders_error?: string | null;
     caddy_use_labels: boolean;
     verify_tls: boolean;
     timeout_seconds: number;
@@ -621,6 +624,17 @@ export type FileBrowseEntry = {
   path: string;
   likely?: boolean;
 };
+
+export function fetchCaddyfileVars(path: string) {
+  const q = `?path=${encodeURIComponent(path)}`;
+  return getJson<{
+    ok: boolean;
+    path: string;
+    placeholders: Array<{ name: string; default?: string | null }>;
+    error?: string | null;
+    values?: Record<string, string>;
+  }>(`/api/settings/networking/caddyfile-vars${q}`);
+}
 
 export function fetchFileBrowse(path = "/") {
   const q = `?path=${encodeURIComponent(path)}`;

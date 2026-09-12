@@ -54,6 +54,8 @@ class NetworkingConfig(BaseModel):
     caddy_admin_url: str = "http://host.docker.internal:2019"
     caddy_use_caddyfile: bool = False
     caddy_caddyfile_path: str = "/config/Caddyfile"
+    # Values for {$VAR} placeholders found in the Caddyfile (Settings UI).
+    caddy_env: dict[str, str] = Field(default_factory=dict)
     caddy_use_labels: bool = True
     verify_tls: bool = True
     timeout_seconds: float = 5.0

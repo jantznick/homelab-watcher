@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -51,9 +52,22 @@ _UPSTREAMS_TPL = re.compile(
 _SKIP_SITE = re.compile(
     r"^(import|respond|redir|rewrite|reverse_proxy|handle|route|basicauth|"
     r"encode|header|log|tls|file_server|php_fastcgi|root|uri|email|"
-    r"acme_server|admin|servers|{$)",
+    r"acme_server|admin|servers)$",
     re.IGNORECASE,
 )
+# Caddyfile adapter: {$VAR} and {$VAR:default}
+_CADDY_DOLLAR = re.compile(
+    r"\{\$([A-Za-z_][A-Za-z0-9_]*)(?::([^}]*))?\}"
+)
+# Runtime placeholder sometimes used in Caddyfiles: {env.VAR}
+_CADDY_ENV_DOT = re.compile(r"\{env\.([A-Za-z_][A-Za-z0-9_]*)\}")
+_ENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+@dataclass(frozen=True)
+class CaddyPlaceholder:
+    name: str
+    default: str | None = None
 
 
 def _norm_host(value: str) -> str:
@@ -122,29 +136,151 @@ def _host_candidates_from_token(token: str) -> list[str]:
     return [host]
 
 
-def parse_caddyfile(text: str) -> list[ProxyRoute]:
+def normalize_caddy_env(raw: Any) -> dict[str, str]:
+    """Accept a dict, list of {name,value}, or dotenv-style text."""
+    out: dict[str, str] = {}
+    if not raw:
+        return out
+    if isinstance(raw, str):
+        return parse_env_text(raw)
+    if isinstance(raw, Mapping):
+        items = raw.items()
+    elif isinstance(raw, list):
+        items = []
+        for row in raw:
+            if isinstance(row, Mapping):
+                items.append(
+                    (row.get("name") or row.get("key"), row.get("value"))
+                )
+            else:
+                continue
+    else:
+        return out
+    for key, val in items:
+        name = str(key or "").strip()
+        if not _ENV_KEY.match(name) or val is None:
+            continue
+        value = str(val)
+        if value == "":
+            continue
+        out[name] = value
+    return out
+
+
+def parse_env_text(text: str) -> dict[str, str]:
+    """Parse KEY=value lines (Compose / Caddy env_file)."""
+    out: dict[str, str] = {}
+    if not text:
+        return out
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.lower().startswith("export "):
+            line = line[7:].strip()
+        if "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        key = key.strip()
+        if not _ENV_KEY.match(key):
+            continue
+        val = val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+            val = val[1:-1]
+        if val == "":
+            continue
+        out[key] = val
+    return out
+
+
+def strip_caddyfile_comments(text: str) -> str:
+    lines: list[str] = []
+    for raw in text.splitlines():
+        line = raw
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            continue
+        if " #" in line:
+            line = line.split(" #", 1)[0]
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def extract_caddy_placeholders(text: str) -> list[CaddyPlaceholder]:
+    """Unique {$VAR} / {env.VAR} names in Caddyfile order (comments ignored)."""
+    if not text:
+        return []
+    body = strip_caddyfile_comments(text)
+    seen: set[str] = set()
+    out: list[CaddyPlaceholder] = []
+    for m in _CADDY_DOLLAR.finditer(body):
+        name = m.group(1)
+        if name in seen:
+            continue
+        seen.add(name)
+        default = m.group(2)
+        out.append(CaddyPlaceholder(name=name, default=default))
+    for m in _CADDY_ENV_DOT.finditer(body):
+        name = m.group(1)
+        if name in seen:
+            continue
+        seen.add(name)
+        out.append(CaddyPlaceholder(name=name, default=None))
+    return out
+
+
+def expand_caddy_placeholders(
+    text: str, env: Mapping[str, str] | None = None
+) -> str:
+    """Replace Caddy {$VAR} / {$VAR:default} / {env.VAR} using provided values."""
+    values = dict(env or {})
+
+    def dollar(m: re.Match[str]) -> str:
+        name = m.group(1)
+        default = m.group(2)
+        if name in values:
+            return values[name]
+        if default is not None:
+            return default
+        return m.group(0)
+
+    def envdot(m: re.Match[str]) -> str:
+        name = m.group(1)
+        if name in values:
+            return values[name]
+        return m.group(0)
+
+    out = _CADDY_DOLLAR.sub(dollar, text)
+    return _CADDY_ENV_DOT.sub(envdot, out)
+
+
+def unexpanded_placeholder_names(text: str) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for m in _CADDY_DOLLAR.finditer(text):
+        if m.group(1) not in seen:
+            seen.add(m.group(1))
+            names.append(m.group(1))
+    for m in _CADDY_ENV_DOT.finditer(text):
+        if m.group(1) not in seen:
+            seen.add(m.group(1))
+            names.append(m.group(1))
+    return names
+
+
+def parse_caddyfile(
+    text: str, env: Mapping[str, str] | None = None
+) -> list[ProxyRoute]:
     """
     Best-effort Caddyfile parser for hostname → reverse_proxy upstream.
 
     Handles simple site blocks; ignores complex matchers / snippets gracefully.
+    Expands {$VAR} / {$VAR:default} / {env.VAR} before parsing.
     """
     if not text or not text.strip():
         return []
 
-    # Strip // and # line comments (keep URLs)
-    lines: list[str] = []
-    for raw in text.splitlines():
-        line = raw
-        # full-line # comments
-        stripped = line.lstrip()
-        if stripped.startswith("#"):
-            continue
-        # trailing # comment when preceded by whitespace
-        if " #" in line:
-            line = line.split(" #", 1)[0]
-        lines.append(line)
-
-    content = "\n".join(lines)
+    content = expand_caddy_placeholders(strip_caddyfile_comments(text), env)
     routes: list[ProxyRoute] = []
     i = 0
     n = len(content)
@@ -172,9 +308,19 @@ def parse_caddyfile(text: str) -> list[ProxyRoute]:
                 i += 1
             continue
 
-        # site address line until { or newline
+        # site address line until block `{` or newline; skip {$VAR} / {env.VAR}
         addr_start = i
-        while i < n and content[i] not in "{\n":
+        while i < n and content[i] != "\n":
+            if content[i] == "{":
+                rest = content[i:]
+                if rest.startswith("{$") or rest.startswith("{env."):
+                    close = content.find("}", i + 1)
+                    if close < 0:
+                        i = n
+                        break
+                    i = close + 1
+                    continue
+                break
             i += 1
         addr_line = content[addr_start:i].strip()
         if i < n and content[i] == "{":
@@ -232,6 +378,8 @@ def _upstreams_from_block(body: str) -> list[str]:
                 break
             if tok.startswith("@") or tok.startswith("/"):
                 continue
+            if tok == "*":
+                continue
             if "=" in tok and not tok.startswith("http"):
                 continue
             nu = _norm_upstream(tok)
@@ -259,24 +407,53 @@ def _dedupe_routes(routes: list[ProxyRoute]) -> list[ProxyRoute]:
     return out
 
 
-def read_caddyfile(path: str) -> tuple[list[ProxyRoute], str | None]:
+def load_caddyfile_text(path: str) -> tuple[str | None, str | None]:
+    """Read Caddyfile text via same-path or HOST_ROOT remap. (text, error)."""
     raw = (path or "").strip()
     if not raw:
-        return [], "Caddyfile path not set"
-    # Prefer path as-is (e.g. /config/Caddyfile), then HOST_ROOT remap
-    # (host /etc/caddy/Caddyfile → /host/etc/caddy/Caddyfile).
+        return None, "Caddyfile path not set"
     from app.container_actions import resolve_visible_path
 
     visible = resolve_visible_path(raw) or raw
     p = Path(visible).expanduser()
     try:
         if not p.is_file():
-            return [], f"Caddyfile not found: {raw}"
-        text = p.read_text(encoding="utf-8", errors="replace")
+            return None, f"Caddyfile not found: {raw}"
+        return p.read_text(encoding="utf-8", errors="replace"), None
     except OSError as exc:
-        return [], f"Cannot read Caddyfile: {exc}"
+        return None, f"Cannot read Caddyfile: {exc}"
+
+
+def scan_caddyfile_placeholders(
+    path: str,
+) -> tuple[list[CaddyPlaceholder], str | None]:
+    text, err = load_caddyfile_text(path)
+    if err:
+        return [], err
+    return extract_caddy_placeholders(text or ""), None
+
+
+def read_caddyfile(
+    path: str, env: Mapping[str, str] | None = None
+) -> tuple[list[ProxyRoute], str | None]:
+    text, err = load_caddyfile_text(path)
+    if err:
+        return [], err
     try:
-        routes = parse_caddyfile(text)
+        expanded = expand_caddy_placeholders(text or "", env)
+        missing = unexpanded_placeholder_names(
+            strip_caddyfile_comments(expanded)
+        )
+        routes = parse_caddyfile(text or "", env=env)
+        if missing:
+            names = ", ".join(f"{{${n}}}" for n in missing)
+            warn = (
+                f"Caddyfile has unsubstituted placeholders: {names}. "
+                "Set them under Settings → Networking."
+            )
+            if not routes:
+                return [], warn
+            return routes, warn
         return routes, None
     except Exception as exc:
         logger.debug("Caddyfile parse failed: %s", exc)
@@ -461,6 +638,7 @@ def discover_caddy_routes(
     admin_url: str = "",
     use_caddyfile: bool = False,
     caddyfile_path: str = "",
+    caddyfile_env: Mapping[str, str] | None = None,
     use_labels: bool = False,
     containers: list[dict[str, Any]] | None = None,
     timeout: float = 5.0,
@@ -484,10 +662,10 @@ def discover_caddy_routes(
 
     if use_caddyfile:
         result.sources_tried.append("caddyfile")
-        routes, err = read_caddyfile(caddyfile_path)
+        routes, err = read_caddyfile(caddyfile_path, env=caddyfile_env)
         if err:
             result.errors.append(err)
-        else:
+        if routes:
             all_routes.extend(routes)
 
     if use_labels:
