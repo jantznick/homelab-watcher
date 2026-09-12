@@ -1,0 +1,61 @@
+# Optional YAML fallback. Prefer Settings in the web UI (saved to SQLite).
+# Empty defaults are fine — configure Plex, Pi-hole, Email, Security, Disks
+# from the dashboard after first boot.
+#
+# Containers always come from the live Docker API (docker.sock), never from this file.
+# Secrets can live in Settings/DB; .env still works for bootstrap (Resend, Pi-hole).
+
+# Custom HTTP/ping/DNS check targets — used if Settings has not saved a DB list yet.
+targets: []
+
+# Optional container name → browser URL when Docker labels are missing.
+container_urls: {}
+
+# Optional Pi-hole (prefer Settings → Pi-hole). Leave url empty.
+pihole:
+  url: ""
+  version: auto
+  verify_tls: true
+
+thresholds:
+  disk_warn_percent: 85
+  # Mounts to monitor (empty = none). Prefer Settings → Disks checkboxes.
+  # disks: []
+  # alert_on_exited: true
+
+registry_cache_hours: 6
+
+# Security (prefer Settings → Security). Disabled by default.
+security:
+  enabled: false
+  # notable_severity: HIGH
+  # notable_posture_severity: high
+  # trivy:
+  #   enabled: true
+  #   scan_interval_hours: 24
+  #   ignore_unfixed: false
+  #   max_scans_per_poll: 2
+  #   timeout_seconds: 180
+  # posture:
+  #   enabled: true
+  # opensca:
+  #   enabled: true
+  #   scan_interval_hours: 24
+  #   max_scans_per_poll: 1
+  #   # Optional: private git clone (or GIT_TOKEN / SCM_TOKEN env)
+  #   # git_token: ""
+  #   # Optional OpenSCA cloud token for richer CVE matching
+  #   # opensca_token: ""
+  #   # Manual overrides: container name or image → git URL
+  #   # scm_overrides:
+  #   #   my-app: https://github.com/example/my-app.git
+
+# Listening ports on Host (Settings → Host). Needs /:/host:ro for host /proc.
+# listening_ports:
+#   enabled: true
+
+# Optional Internet speed check (Settings → Host). Cloudflare public endpoints, no key.
+# Disabled by default — transfers are non-trivial.
+# speed_test:
+#   enabled: false
+#   interval_hours: 12

@@ -1,0 +1,39 @@
+services:
+  homelab-watcher:
+    build: .
+    container_name: homelab-watcher
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      - DATABASE_PATH=/data/homelab-watcher.db
+      - CONFIG_PATH=/config/config.yaml
+      - HOST_PROC=/host/proc
+      - HOST_ROOT=/host
+    volumes:
+      # Docker socket — writable required for Update / Tear down actions.
+      # For inventory-only, you may use :ro and disable actions in Settings → General.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Full host root (read-only) so CPU/RAM, disk mounts under /mnt/...,
+      # and listening-port inventory (host /proc/net via HOST_PROC) are visible.
+      # Configure disks in Settings → Disks; ports + speed in Settings → Host.
+      # Also lets Compose-first Update resolve project.working_dir / config_files
+      # under /host/... when stacks live on the host (see README).
+      - /:/host:ro,rslave
+      # Optional same-path mount if you prefer not relying on /host remapping,
+      # or if a path is missing under the host root mount:
+      # - /home/user/stacks:/home/user/stacks:ro
+      - ./config.yaml:/config/config.yaml:ro
+      - watcher-data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # Optional Traefik / Caddy labels if you reverse-proxy this UI:
+    # labels:
+    #   - "traefik.enable=true"
+    #   - "traefik.http.routers.homelab-watcher.rule=Host(`watcher.example.com`)"
+    #   - "traefik.http.services.homelab-watcher.loadbalancer.server.port=8080"
+
+volumes:
+  watcher-data:

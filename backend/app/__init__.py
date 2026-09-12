@@ -1,0 +1,1 @@
+"""Homelab Watcher backend."""

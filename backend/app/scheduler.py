@@ -1,0 +1,275 @@
+"""Background poll loop and digest scheduler."""
+
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timezone
+
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
+
+from app import db
+from app.access_urls import enrich_container_access
+from app.checks import run_all_checks
+from app.config import get_settings
+from app.container_enrich import correlate_pihole
+from app.digest import run_scheduled_digest
+from app.docker_client import get_docker_error, get_docker_endpoint, get_docker_status, list_containers
+from app.host_metrics import collect_host_metrics
+from app.pihole import fetch_pihole_dns
+from app.runtime_settings import (
+    apply_watched,
+    effective_poll_interval,
+    effective_yaml_overlay,
+    get_speed_test_last,
+    resolve_digest_settings,
+    resolve_pihole,
+    resolve_speed_test,
+    save_speed_test_last,
+)
+from app.security import enrich_security
+from app.speed_test import run_speed_test, should_run_scheduled
+from app.updates import enrich_with_updates
+
+logger = logging.getLogger(__name__)
+
+scheduler = BackgroundScheduler()
+_last_poll_at: str | None = None
+_last_poll_error: str | None = None
+_last_pihole: dict | None = None
+
+
+def get_poll_status() -> dict:
+    docker_error = get_docker_error()
+    return {
+        "last_poll_at": _last_poll_at,
+        "last_poll_error": _last_poll_error,
+        "poll_interval_seconds": effective_poll_interval(),
+        "pihole": _last_pihole,
+        "docker_available": docker_error is None and get_docker_endpoint() is not None,
+        "docker_error": docker_error,
+        "docker_endpoint": get_docker_endpoint(),
+        "docker": get_docker_status(),
+    }
+
+
+def get_last_pihole() -> dict | None:
+    return _last_pihole
+
+
+def poll_once() -> None:
+    global _last_poll_at, _last_poll_error, _last_pihole
+    try:
+        yaml_cfg = effective_yaml_overlay()
+        containers = list_containers()
+        containers = enrich_with_updates(containers, yaml_cfg)
+        enrich_container_access(containers, yaml_cfg.container_urls)
+        apply_watched(containers)
+
+        try:
+            enrich_security(containers, yaml_cfg.security)
+        except Exception as exc:
+            logger.warning("Security enrichment skipped: %s", exc)
+
+        try:
+            ph_cfg, password, token, _src = resolve_pihole()
+            pihole = fetch_pihole_dns(
+                ph_cfg,
+                password_override=password,
+                token_override=token,
+            )
+            _last_pihole = correlate_pihole(containers, pihole)
+        except Exception as exc:
+            logger.warning("Pi-hole enrichment skipped: %s", exc)
+            _last_pihole = {
+                "configured": bool((resolve_pihole()[0].url or "").strip()),
+                "ok": False,
+                "version": None,
+                "message": str(exc),
+                "record_count": 0,
+            }
+            for c in containers:
+                c.setdefault("pihole_matched", False)
+                c.setdefault("pihole_hostnames", [])
+
+        db.save_container_snapshots(containers)
+
+        host = collect_host_metrics(yaml_cfg, containers=containers)
+        db.save_host_snapshot(host)
+
+        checks = run_all_checks(yaml_cfg)
+        db.save_check_results(checks)
+
+        db.prune_old_rows(14)
+        _last_poll_at = datetime.now(timezone.utc).isoformat()
+        _last_poll_error = None
+        logger.info(
+            "Poll complete: %d containers, %d checks",
+            len(containers),
+            len(checks),
+        )
+    except Exception as exc:
+        _last_poll_error = str(exc)
+        logger.exception("Poll failed")
+
+
+def speed_test_once(*, force: bool = False) -> dict:
+    """
+    Run Internet speed check outside poll_once so transfers never block the poll loop.
+    force=True skips the interval gate (manual Run now).
+    """
+    cfg, _ = resolve_speed_test()
+    last = get_speed_test_last()
+    if not force:
+        if not should_run_scheduled(
+            enabled=bool(cfg.enabled),
+            interval_hours=float(cfg.interval_hours),
+            last=last,
+        ):
+            return last or {
+                "ok": False,
+                "skipped": True,
+                "error": "Not due yet.",
+            }
+
+    try:
+        result = run_speed_test()
+        if not result.get("busy"):
+            save_speed_test_last(result)
+        return result
+    except Exception as exc:
+        logger.warning("Speed test job failed: %s", exc)
+        fail = {
+            "ok": False,
+            "provider": "cloudflare",
+            "taken_at": datetime.now(timezone.utc).isoformat(),
+            "download_mbps": None,
+            "upload_mbps": None,
+            "ping_ms": None,
+            "error": "Speed check failed.",
+        }
+        save_speed_test_last(fail)
+        return fail
+
+
+def _speed_test_tick() -> None:
+    """Periodic gate — only runs the heavy transfer when due."""
+    try:
+        speed_test_once(force=False)
+    except Exception as exc:
+        logger.warning("Speed test tick skipped: %s", exc)
+
+
+def reschedule_poll() -> None:
+    """Refresh poll interval from Settings."""
+    if not scheduler.running:
+        return
+    seconds = effective_poll_interval()
+    scheduler.add_job(
+        poll_once,
+        IntervalTrigger(seconds=seconds),
+        id="poll",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+
+
+def reschedule_speed_test() -> None:
+    """Refresh speed-test tick from Settings (lightweight gate every 15m)."""
+    if not scheduler.running:
+        return
+    cfg, _ = resolve_speed_test()
+    if not cfg.enabled or float(cfg.interval_hours or 0) <= 0:
+        try:
+            scheduler.remove_job("speed_test")
+        except Exception:
+            pass
+        return
+    # Tick often; should_run_scheduled decides whether to transfer.
+    scheduler.add_job(
+        _speed_test_tick,
+        IntervalTrigger(minutes=15),
+        id="speed_test",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+
+
+def reschedule_digest() -> None:
+    if not scheduler.running:
+        return
+    # Drop legacy single job and all per-profile digest jobs.
+    for job in list(scheduler.get_jobs()):
+        jid = job.id or ""
+        if jid == "digest" or jid.startswith("digest:"):
+            try:
+                scheduler.remove_job(jid)
+            except Exception:
+                pass
+
+    digest, _ = resolve_digest_settings()
+    profiles = digest.get("profiles") or []
+    scheduled_n = 0
+    for profile in profiles:
+        if not isinstance(profile, dict) or not profile.get("enabled"):
+            continue
+        cron = (profile.get("digest_cron") or "").strip()
+        parts = cron.split()
+        pid = str(profile.get("id") or "").strip()
+        if not pid or len(parts) != 5:
+            if cron:
+                logger.warning(
+                    "Digest “%s” enabled but schedule incomplete — not scheduled",
+                    profile.get("name") or pid or "?",
+                )
+            continue
+        tz = profile.get("tz") or get_settings().tz or "UTC"
+        minute, hour, day, month, day_of_week = parts
+        scheduler.add_job(
+            run_scheduled_digest,
+            CronTrigger(
+                minute=minute,
+                hour=hour,
+                day=day,
+                month=month,
+                day_of_week=day_of_week,
+                timezone=tz,
+            ),
+            id=f"digest:{pid}",
+            kwargs={"profile_id": pid},
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+        scheduled_n += 1
+    if scheduled_n:
+        logger.info("Scheduled %d digest profile(s)", scheduled_n)
+
+
+def start_scheduler() -> None:
+    if scheduler.running:
+        return
+
+    seconds = effective_poll_interval()
+    scheduler.add_job(
+        poll_once,
+        IntervalTrigger(seconds=seconds),
+        id="poll",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+
+    scheduler.start()
+    # Only schedule digest when enabled + complete (no silent Sunday 9am default)
+    reschedule_digest()
+    reschedule_speed_test()
+    scheduler.add_job(poll_once, id="poll_now", replace_existing=True)
+
+
+def shutdown_scheduler() -> None:
+    if scheduler.running:
+        scheduler.shutdown(wait=False)

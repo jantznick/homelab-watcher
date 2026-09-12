@@ -1,0 +1,13 @@
+# Requires Python >=3.12,<3.14 (Docker image: python:3.12-slim).
+# Do not use 3.14 yet — pydantic-core / PyO3 lack support; see README.
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+docker==7.1.0
+httpx==0.28.1
+apscheduler==3.10.4
+pyyaml==6.0.2
+psutil==6.1.1
+resend==2.6.0
+dnspython==2.7.0
+pydantic==2.10.4
+pydantic-settings==2.7.0
