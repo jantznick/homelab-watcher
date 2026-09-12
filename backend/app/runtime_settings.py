@@ -9,6 +9,10 @@ from __future__ import annotations
 from typing import Any, Literal
 
 from app import db
+from app.caddy_routes import (
+    normalize_caddy_env,
+    scan_caddyfile_placeholders,
+)
 from app.config import (
     AppYamlConfig,
     ListeningPortsConfig,
@@ -416,6 +420,9 @@ def resolve_networking(
                 or yaml_cfg.caddy_caddyfile_path
                 or "/config/Caddyfile"
             ).strip(),
+            caddy_env=_merge_caddy_env(
+                yaml_cfg.caddy_env, stored.get("caddy_env")
+            ),
             caddy_use_labels=bool(
                 stored.get("caddy_use_labels", yaml_cfg.caddy_use_labels)
             ),
@@ -432,8 +439,23 @@ def resolve_networking(
     return NetworkingConfig(), "none"
 
 
+def _merge_caddy_env(
+    yaml_env: dict[str, str] | None, stored: Any
+) -> dict[str, str]:
+    merged = dict(normalize_caddy_env(yaml_env))
+    merged.update(normalize_caddy_env(stored))
+    return merged
+
+
 def networking_public_view() -> dict[str, Any]:
     cfg, source = resolve_networking()
+    placeholders: list[dict[str, str | None]] = []
+    scan_error: str | None = None
+    if cfg.caddy_use_caddyfile and cfg.caddy_caddyfile_path:
+        found, scan_error = scan_caddyfile_placeholders(cfg.caddy_caddyfile_path)
+        placeholders = [
+            {"name": p.name, "default": p.default} for p in found
+        ]
     return {
         "source": source,
         "proxy_type": cfg.proxy_type,
@@ -441,6 +463,9 @@ def networking_public_view() -> dict[str, Any]:
         "caddy_admin_url": cfg.caddy_admin_url,
         "caddy_use_caddyfile": cfg.caddy_use_caddyfile,
         "caddy_caddyfile_path": cfg.caddy_caddyfile_path,
+        "caddy_env": dict(cfg.caddy_env or {}),
+        "caddy_placeholders": placeholders,
+        "caddy_placeholders_error": scan_error,
         "caddy_use_labels": cfg.caddy_use_labels,
         "verify_tls": cfg.verify_tls,
         "timeout_seconds": cfg.timeout_seconds,

@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import {
   fetchDiskDiscover,
   fetchFileBrowse,
+  fetchCaddyfileVars,
   fetchSettings,
   putSettings,
   runHostSpeedTest,
@@ -48,6 +49,8 @@ const WEEKDAYS: { id: string; short: string; label: string }[] = [
   { id: "6", short: "Sat", label: "Saturday" },
   { id: "0", short: "Sun", label: "Sunday" },
 ];
+
+type CaddyPlaceholder = { name: string; default?: string | null };
 
 type TargetDraft = {
   name: string;
@@ -128,6 +131,14 @@ export function SettingsPanel({
   );
   const [netCaddyfile, setNetCaddyfile] = useState(false);
   const [netCaddyfilePath, setNetCaddyfilePath] = useState("/config/Caddyfile");
+  const [netCaddyEnv, setNetCaddyEnv] = useState<Record<string, string>>({});
+  const [netPlaceholders, setNetPlaceholders] = useState<CaddyPlaceholder[]>(
+    [],
+  );
+  const [netPlaceholderError, setNetPlaceholderError] = useState<string | null>(
+    null,
+  );
+  const [netPlaceholderBusy, setNetPlaceholderBusy] = useState(false);
   const [netLabels, setNetLabels] = useState(true);
   const [netTls, setNetTls] = useState(true);
   const [browseOpen, setBrowseOpen] = useState(false);
@@ -254,6 +265,11 @@ export function SettingsPanel({
         setNetCaddyfile(Boolean(s.networking?.caddy_use_caddyfile));
         setNetCaddyfilePath(
           s.networking?.caddy_caddyfile_path || "/config/Caddyfile",
+        );
+        setNetCaddyEnv({ ...(s.networking?.caddy_env || {}) });
+        setNetPlaceholders(s.networking?.caddy_placeholders || []);
+        setNetPlaceholderError(
+          s.networking?.caddy_placeholders_error || null,
         );
         setNetLabels(s.networking?.caddy_use_labels !== false);
         setNetTls(s.networking?.verify_tls !== false);
@@ -418,6 +434,46 @@ export function SettingsPanel({
     }
   }
 
+  function networkingPayload() {
+    const env: Record<string, string> = {};
+    for (const [name, value] of Object.entries(netCaddyEnv)) {
+      const key = name.trim();
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
+      if (value === "") continue;
+      env[key] = value;
+    }
+    return {
+      proxy_type: netProxy,
+      caddy_use_admin_api: netAdminApi,
+      caddy_admin_url: netAdminUrl,
+      caddy_use_caddyfile: netCaddyfile,
+      caddy_caddyfile_path: netCaddyfilePath,
+      caddy_env: env,
+      caddy_use_labels: netLabels,
+      verify_tls: netTls,
+    };
+  }
+
+  async function scanCaddyVars(path: string) {
+    const p = path.trim();
+    if (!p) {
+      setNetPlaceholders([]);
+      setNetPlaceholderError(null);
+      return;
+    }
+    setNetPlaceholderBusy(true);
+    try {
+      const r = await fetchCaddyfileVars(p);
+      setNetPlaceholders(r.placeholders || []);
+      setNetPlaceholderError(r.error || null);
+    } catch (e) {
+      setNetPlaceholders([]);
+      setNetPlaceholderError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setNetPlaceholderBusy(false);
+    }
+  }
+
   function openCaddyBrowse() {
     setBrowseOpen(true);
     let start = "/";
@@ -437,17 +493,18 @@ export function SettingsPanel({
     setError(null);
     try {
       await putSettings("networking", {
-        proxy_type: netProxy,
-        caddy_use_admin_api: netAdminApi,
-        caddy_admin_url: netAdminUrl,
+        ...networkingPayload(),
         caddy_use_caddyfile: true,
         caddy_caddyfile_path: filePath,
-        caddy_use_labels: netLabels,
-        verify_tls: netTls,
       });
       onSaved();
       const s = await fetchSettings();
       setData(s);
+      setNetCaddyEnv({ ...(s.networking?.caddy_env || {}) });
+      setNetPlaceholders(s.networking?.caddy_placeholders || []);
+      setNetPlaceholderError(
+        s.networking?.caddy_placeholders_error || null,
+      );
       const r = await testNetworking();
       setToast(
         r.ok
@@ -474,6 +531,24 @@ export function SettingsPanel({
     }
     return out;
   }
+
+  const caddyEnvFields: CaddyPlaceholder[] = (() => {
+    const seen = new Set<string>();
+    const out: CaddyPlaceholder[] = [];
+    for (const p of netPlaceholders) {
+      const name = (p.name || "").trim();
+      if (!name || seen.has(name)) continue;
+      seen.add(name);
+      out.push({ name, default: p.default });
+    }
+    for (const name of Object.keys(netCaddyEnv)) {
+      if (!name || seen.has(name)) continue;
+      if ((netCaddyEnv[name] || "") === "") continue;
+      seen.add(name);
+      out.push({ name, default: null });
+    }
+    return out;
+  })();
 
   const body = (
     <div className={asPage ? "settings-page" : "settings-layout"}>
@@ -788,7 +863,11 @@ export function SettingsPanel({
                   <input
                     type="checkbox"
                     checked={netCaddyfile}
-                    onChange={(e) => setNetCaddyfile(e.target.checked)}
+                    onChange={(e) => {
+                      const on = e.target.checked;
+                      setNetCaddyfile(on);
+                      if (on) void scanCaddyVars(netCaddyfilePath);
+                    }}
                   />
                   Caddyfile path
                 </label>
@@ -800,6 +879,7 @@ export function SettingsPanel({
                         placeholder="/etc/caddy/Caddyfile"
                         value={netCaddyfilePath}
                         onChange={(e) => setNetCaddyfilePath(e.target.value)}
+                        onBlur={() => void scanCaddyVars(netCaddyfilePath)}
                       />
                       <button
                         type="button"
@@ -930,6 +1010,60 @@ export function SettingsPanel({
                   a path. Selecting a file saves it and enables Caddyfile
                   discovery — works alongside Admin API / labels.
                 </p>
+                {netCaddyfile ? (
+                  <div className="caddy-env-block">
+                    <p className="helper" style={{ marginTop: "0.35rem" }}>
+                      Environment variables found in this Caddyfile (
+                      <code>{"{$VAR}"}</code>
+                      ). Enter values here so hostnames like{" "}
+                      <code>{"cloud.{$MY_DOMAIN}"}</code> resolve. Same names
+                      Caddy reads from Compose <code>env_file</code>.
+                    </p>
+                    {netPlaceholderBusy ? (
+                      <div className="empty">Scanning Caddyfile…</div>
+                    ) : null}
+                    {netPlaceholderError ? (
+                      <div className="error-inline">
+                        {netPlaceholderError}
+                      </div>
+                    ) : null}
+                    {!netPlaceholderBusy &&
+                    !netPlaceholderError &&
+                    netPlaceholders.length === 0 ? (
+                      <p className="helper">
+                        No <code>{"{$VAR}"}</code> placeholders in this
+                        Caddyfile.
+                      </p>
+                    ) : null}
+                    {caddyEnvFields.length > 0 ? (
+                      <div className="caddy-env-list">
+                        {caddyEnvFields.map((row) => (
+                          <label key={row.name} className="caddy-env-row">
+                            <span className="caddy-env-name">
+                              <code>{`{$${row.name}}`}</code>
+                            </span>
+                            <input
+                              placeholder={
+                                row.default != null && row.default !== ""
+                                  ? row.default
+                                  : "value"
+                              }
+                              value={netCaddyEnv[row.name] ?? ""}
+                              onChange={(e) =>
+                                setNetCaddyEnv((prev) => ({
+                                  ...prev,
+                                  [row.name]: e.target.value,
+                                }))
+                              }
+                              autoComplete="off"
+                              spellCheck={false}
+                            />
+                          </label>
+                        ))}
+                      </div>
+                    ) : null}
+                  </div>
+                ) : null}
                 <label className="check-row">
                   <input
                     type="checkbox"
@@ -955,15 +1089,7 @@ export function SettingsPanel({
                 className="btn btn-primary"
                 disabled={busy}
                 onClick={() => {
-                  void save("networking", {
-                    proxy_type: netProxy,
-                    caddy_use_admin_api: netAdminApi,
-                    caddy_admin_url: netAdminUrl,
-                    caddy_use_caddyfile: netCaddyfile,
-                    caddy_caddyfile_path: netCaddyfilePath,
-                    caddy_use_labels: netLabels,
-                    verify_tls: netTls,
-                  });
+                  void save("networking", networkingPayload());
                 }}
               >
                 Save Networking
