@@ -429,6 +429,63 @@ def reschedule_digest() -> None:
         logger.info("Scheduled %d digest profile(s)", scheduled_n)
 
 
+def reschedule_auto_updates() -> None:
+    """Refresh per-container Compose auto-update cron jobs from SQLite policies."""
+    if not scheduler.running:
+        return
+    for job in list(scheduler.get_jobs()):
+        jid = job.id or ""
+        if jid.startswith("auto_update:"):
+            try:
+                scheduler.remove_job(jid)
+            except Exception:
+                pass
+
+    try:
+        policies = db.list_container_auto_updates()
+    except Exception as exc:
+        logger.warning("Auto-update reschedule skipped: %s", exc)
+        return
+
+    from app.auto_update import run_scheduled_auto_update
+
+    scheduled_n = 0
+    for policy in policies:
+        if not policy.get("enabled"):
+            continue
+        key = str(policy.get("watched_key") or "").strip()
+        cron = (policy.get("cron") or "").strip()
+        parts = cron.split()
+        if not key or len(parts) != 5:
+            if policy.get("enabled"):
+                logger.warning(
+                    "Auto-update “%s” enabled but schedule incomplete — not scheduled",
+                    policy.get("name") or key or "?",
+                )
+            continue
+        tz = policy.get("tz") or get_settings().tz or "UTC"
+        minute, hour, day, month, day_of_week = parts
+        scheduler.add_job(
+            run_scheduled_auto_update,
+            CronTrigger(
+                minute=minute,
+                hour=hour,
+                day=day,
+                month=month,
+                day_of_week=day_of_week,
+                timezone=tz,
+            ),
+            id=f"auto_update:{key}",
+            kwargs={"watched_key": key},
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+        scheduled_n += 1
+    if scheduled_n:
+        logger.info("Scheduled %d container auto-update(s)", scheduled_n)
+
+
 def start_scheduler() -> None:
     if scheduler.running:
         return
@@ -447,6 +504,7 @@ def start_scheduler() -> None:
     # Only schedule digest when enabled + complete (no silent Sunday 9am default)
     reschedule_digest()
     reschedule_speed_test()
+    reschedule_auto_updates()
     scheduler.add_job(poll_once, id="poll_now", replace_existing=True)
 
 

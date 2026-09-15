@@ -91,6 +91,29 @@ def apply_container_notes(containers: list[dict[str, Any]]) -> None:
         c["notes"] = row.get("notes") or ""
 
 
+def apply_container_auto_updates(containers: list[dict[str, Any]]) -> None:
+    """
+    Attach auto-update policy summaries onto container dicts.
+
+    Fail soft: missing table / DB errors leave auto_update=None.
+    """
+    try:
+        from app.auto_update import policy_public_view
+
+        policies = db.container_auto_updates_map()
+    except Exception:
+        policies = {}
+        policy_public_view = None  # type: ignore[assignment]
+    for c in containers:
+        wk = c.get("watched_key") or c.get("vital_key") or watched_key_for_container(c)
+        c["watched_key"] = wk
+        row = policies.get(wk)
+        if row and policy_public_view is not None:
+            c["auto_update"] = policy_public_view(row)
+        else:
+            c["auto_update"] = None
+
+
 def apply_vitals(containers: list[dict[str, Any]]) -> None:
     """Deprecated alias for apply_watched."""
     apply_watched(containers)

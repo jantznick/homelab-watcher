@@ -254,6 +254,17 @@ export function ContainersPanel({
             {bump}
           </span>
         ) : null}
+        {c.auto_update?.enabled ? (
+          <span
+            className="badge-auto"
+            title={
+              c.auto_update.schedule_summary ||
+              "Compose auto-update scheduled"
+            }
+          >
+            auto
+          </span>
+        ) : null}
         {c.pihole_matched ? (
           <span
             className="badge-dns"
