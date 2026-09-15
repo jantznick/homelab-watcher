@@ -119,6 +119,12 @@ Kill and Remove use stronger in-drawer confirms.
 
 If the compose project directory / config files are not visible inside Watcher, the job fails with a clear error (mount stacks or use `/:/host:ro` remapping — see **Compose-first updates** above).
 
+### Auto-update (Compose only, per container)
+
+Open a container drawer → **Auto-update**. Pick daily or weekly + a time (same plain-language schedule as Email digests). When due, Watcher runs the same Compose `pull` + `up -d` as manual Update — only if **Settings → General → Enable container actions** is on.
+
+By default, auto-update runs only when the last poll marked an image update available. Turn that off to always pull on the cadence. Standalone (non-Compose) containers cannot be auto-updated.
+
 ### Tear down / Remove
 
 Options (custom “I understand” confirmation):

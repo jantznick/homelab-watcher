@@ -52,6 +52,29 @@ export type ContainerMount = {
   mode: string;
 };
 
+export type ContainerAutoUpdatePolicy = {
+  watched_key?: string;
+  enabled: boolean;
+  schedule_frequency?: string | null;
+  schedule_weekday?: string | null;
+  schedule_hour?: number | null;
+  schedule_minute?: number | null;
+  cron?: string | null;
+  tz?: string;
+  only_when_available?: boolean;
+  name?: string | null;
+  compose_project?: string | null;
+  compose_service?: string | null;
+  scheduled?: boolean;
+  schedule_summary?: string;
+  next_at?: string | null;
+  last_run_at?: string | null;
+  last_status?: string | null;
+  last_message?: string | null;
+  last_job_id?: string | null;
+  updated_at?: string | null;
+};
+
 export type ContainerItem = {
   container_id: string;
   name: string;
@@ -103,6 +126,8 @@ export type ContainerItem = {
   description?: string | null;
   /** User multiline notes (survives recreate via watched_key). */
   notes?: string | null;
+  /** Per-container Compose auto-update cadence (survives recreate via watched_key). */
+  auto_update?: ContainerAutoUpdatePolicy | null;
   compose_project?: string | null;
   compose_service?: string | null;
   compose_workdir?: string | null;
@@ -690,6 +715,31 @@ export function saveContainerNotes(body: {
     updated_at: string | null;
     error?: string;
   }>("/api/containers/notes", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export function saveContainerAutoUpdate(body: {
+  watched_key?: string;
+  name?: string;
+  compose_project?: string | null;
+  compose_service?: string | null;
+  enabled: boolean;
+  schedule_frequency?: string | null;
+  schedule_weekday?: string | null;
+  schedule_hour?: number | null;
+  schedule_minute?: number | null;
+  tz?: string;
+  only_when_available?: boolean;
+}) {
+  return getJson<
+    ContainerAutoUpdatePolicy & {
+      ok: boolean;
+      error?: string;
+    }
+  >("/api/containers/auto-update", {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),

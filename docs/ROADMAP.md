@@ -64,6 +64,7 @@ Honest gaps to close first (often higher value than brand-new features):
 - **Restart count / OOM** flags from inspect.
 - **Compose project** grouping (project → services) as an alternate Containers view.
 - Image **age** and “how long has update_available been true.”
+- ~~Per-container **auto-update** cadence (Compose pull+up on a schedule)~~ — shipped (drawer → Auto-update).
 
 ### Security
 

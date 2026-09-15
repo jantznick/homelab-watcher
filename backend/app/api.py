@@ -29,6 +29,7 @@ from app.docker_disk import get_docker_disk_usage
 from app.digest import collect_notable, next_cron_fire, send_digest
 from app.runtime_settings import (
     actions_enabled,
+    apply_container_auto_updates,
     apply_container_notes,
     apply_watched,
     digest_public_view,
@@ -59,6 +60,7 @@ from app.scheduler import (
     get_poll_status,
     poll_once,
     refresh_pihole_dns_snapshot,
+    reschedule_auto_updates,
     reschedule_digest,
     reschedule_poll,
     reschedule_speed_test,
@@ -135,6 +137,7 @@ def _container_item(r: dict[str, Any]) -> dict[str, Any]:
         "vital_key": raw.get("watched_key") or raw.get("vital_key"),
         "description": raw.get("description") or "",
         "notes": raw.get("notes") or "",
+        "auto_update": raw.get("auto_update"),
         "compose_project": raw.get("compose_project"),
         "compose_service": raw.get("compose_service"),
         "compose_workdir": raw.get("compose_workdir"),
@@ -227,6 +230,10 @@ def containers() -> dict[str, Any]:
         apply_container_notes(items_raw)
     except Exception:
         pass
+    try:
+        apply_container_auto_updates(items_raw)
+    except Exception:
+        pass
     by_name = {c.get("name"): c for c in items_raw}
 
     items = []
@@ -246,6 +253,7 @@ def containers() -> dict[str, Any]:
         parsed["vital_key"] = watched_key
         parsed["description"] = live.get("description") or ""
         parsed["notes"] = live.get("notes") or ""
+        parsed["auto_update"] = live.get("auto_update")
         items.append(parsed)
 
     pihole = get_last_pihole() or {
@@ -366,6 +374,158 @@ def put_container_notes(body: ContainerNotesBody) -> dict[str, Any]:
     return _upsert_container_notes(body)
 
 
+# ----- per-container auto-update policies (before /containers/{id}) -----
+
+class ContainerAutoUpdateBody(BaseModel):
+    watched_key: str | None = None
+    name: str | None = None
+    compose_project: str | None = None
+    compose_service: str | None = None
+    enabled: bool | None = None
+    schedule_frequency: str | None = None
+    schedule_weekday: str | None = None
+    schedule_hour: int | None = None
+    schedule_minute: int | None = None
+    tz: str | None = None
+    only_when_available: bool | None = None
+
+    def key(self) -> str | None:
+        if self.watched_key and self.watched_key.strip():
+            return self.watched_key.strip()
+        return None
+
+
+def _resolve_auto_update_key(body: ContainerAutoUpdateBody) -> str:
+    key = body.key()
+    if key:
+        return key
+    return watched_key_for_container(
+        {
+            "name": body.name or "",
+            "labels": {
+                "com.docker.compose.project": body.compose_project or "",
+                "com.docker.compose.service": body.compose_service or "",
+            },
+        }
+    )
+
+
+@router.get("/containers/auto-update")
+def list_container_auto_updates() -> dict[str, Any]:
+    """List all per-container auto-update policies."""
+    from app.auto_update import policy_public_view
+
+    try:
+        items = [
+            policy_public_view(row) for row in db.list_container_auto_updates()
+        ]
+        return {"ok": True, "items": items}
+    except Exception as exc:
+        return {"ok": False, "items": [], "error": str(exc)}
+
+
+@router.put("/containers/auto-update")
+@router.patch("/containers/auto-update")
+def put_container_auto_update(body: ContainerAutoUpdateBody) -> dict[str, Any]:
+    """Create/update an auto-update cadence for a stable watched_key."""
+    from app.auto_update import normalize_policy_input, policy_public_view
+    from app.config import get_settings
+
+    key = _resolve_auto_update_key(body)
+    if not key or key in ("compose:/", "name:"):
+        raise HTTPException(status_code=400, detail="watched_key or name required")
+
+    existing = {}
+    try:
+        existing = db.get_container_auto_update(key) or {}
+    except Exception:
+        existing = {}
+
+    payload = {
+        "enabled": (
+            body.enabled if body.enabled is not None else bool(existing.get("enabled"))
+        ),
+        "schedule_frequency": (
+            body.schedule_frequency
+            if body.schedule_frequency is not None
+            else existing.get("schedule_frequency")
+        ),
+        "schedule_weekday": (
+            body.schedule_weekday
+            if body.schedule_weekday is not None
+            else existing.get("schedule_weekday")
+        ),
+        "schedule_hour": (
+            body.schedule_hour
+            if body.schedule_hour is not None
+            else existing.get("schedule_hour")
+        ),
+        "schedule_minute": (
+            body.schedule_minute
+            if body.schedule_minute is not None
+            else existing.get("schedule_minute")
+        ),
+        "tz": body.tz if body.tz is not None else (existing.get("tz") or get_settings().tz or "UTC"),
+        "only_when_available": (
+            body.only_when_available
+            if body.only_when_available is not None
+            else existing.get("only_when_available", True)
+        ),
+        "name": body.name if body.name is not None else existing.get("name"),
+        "compose_project": (
+            body.compose_project
+            if body.compose_project is not None
+            else existing.get("compose_project")
+        ),
+        "compose_service": (
+            body.compose_service
+            if body.compose_service is not None
+            else existing.get("compose_service")
+        ),
+    }
+
+    # Allow clearing schedule when disabling without requiring complete fields.
+    if payload.get("schedule_frequency") == "":
+        payload["schedule_frequency"] = None
+    if payload.get("schedule_weekday") == "":
+        payload["schedule_weekday"] = None
+
+    try:
+        normalized = normalize_policy_input(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
+        row = db.upsert_container_auto_update(key, **normalized)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": str(exc),
+            "watched_key": key,
+        }
+
+    try:
+        reschedule_auto_updates()
+    except Exception as exc:
+        logger.warning("Auto-update reschedule after save failed: %s", exc)
+
+    return {"ok": True, **policy_public_view(row)}
+
+
+@router.delete("/containers/auto-update")
+def delete_container_auto_update(watched_key: str) -> dict[str, Any]:
+    """Remove an auto-update policy."""
+    key = (watched_key or "").strip()
+    if not key:
+        raise HTTPException(status_code=400, detail="watched_key required")
+    try:
+        db.clear_container_auto_update(key)
+        reschedule_auto_updates()
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "watched_key": key}
+    return {"ok": True, "watched_key": key}
+
+
 @router.get("/containers/{container_id}")
 def container_detail(container_id: str) -> dict[str, Any]:
     rows = [_parse_raw(r) for r in db.latest_containers()]
@@ -380,6 +540,10 @@ def container_detail(container_id: str) -> dict[str, Any]:
                 apply_container_notes([raw])
             except Exception:
                 pass
+            try:
+                apply_container_auto_updates([raw])
+            except Exception:
+                pass
             watched = bool(raw.get("watched", raw.get("vital")))
             watched_key = raw.get("watched_key") or raw.get("vital_key")
             item["watched"] = watched
@@ -388,6 +552,7 @@ def container_detail(container_id: str) -> dict[str, Any]:
             item["vital_key"] = watched_key
             item["description"] = raw.get("description") or ""
             item["notes"] = raw.get("notes") or ""
+            item["auto_update"] = raw.get("auto_update")
             item["security"] = raw.get("security") or item.get("security")
             item["inspect_summary"] = {
                 "privileged": bool((raw.get("inspect") or {}).get("HostConfig", {}).get("Privileged")),
@@ -876,7 +1041,9 @@ def get_all_settings() -> dict[str, Any]:
                 "`compose stop|start|restart` when the project directory is visible; "
                 "otherwise the Docker Engine API is used. Pause / unpause use the "
                 "Engine API; kill prefers `compose kill` when possible. Standalone "
-                "containers support lifecycle actions but cannot be updated from the UI."
+                "containers support lifecycle actions but cannot be updated from the UI. "
+                "Per-container Auto-update (drawer) uses the same Compose path on a "
+                "daily/weekly cadence when actions are enabled."
             ),
             "host_disks": (
                 "Watcher discovers mounts like df; you pick which ones to monitor. "

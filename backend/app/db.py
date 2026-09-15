@@ -147,6 +147,26 @@ def init_db() -> None:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS container_auto_updates (
+                watched_key TEXT PRIMARY KEY,
+                enabled INTEGER NOT NULL DEFAULT 0,
+                schedule_frequency TEXT,
+                schedule_weekday TEXT,
+                schedule_hour INTEGER,
+                schedule_minute INTEGER,
+                cron TEXT,
+                tz TEXT NOT NULL DEFAULT 'UTC',
+                only_when_available INTEGER NOT NULL DEFAULT 1,
+                name TEXT,
+                compose_project TEXT,
+                compose_service TEXT,
+                last_run_at TEXT,
+                last_status TEXT,
+                last_message TEXT,
+                last_job_id TEXT,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_containers_taken ON container_snapshots(taken_at);
             CREATE INDEX IF NOT EXISTS idx_host_taken ON host_snapshots(taken_at);
             CREATE INDEX IF NOT EXISTS idx_checks_taken ON check_results(taken_at);
@@ -359,6 +379,155 @@ def clear_container_notes(watched_key: str) -> None:
     with db() as conn:
         conn.execute(
             "DELETE FROM container_notes WHERE watched_key = ?", (watched_key,)
+        )
+
+
+# --- per-container auto-update policies (keyed like notes / stars) ---
+
+def _auto_update_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "watched_key": row.get("watched_key"),
+        "enabled": bool(row.get("enabled")),
+        "schedule_frequency": row.get("schedule_frequency"),
+        "schedule_weekday": row.get("schedule_weekday"),
+        "schedule_hour": row.get("schedule_hour"),
+        "schedule_minute": row.get("schedule_minute"),
+        "cron": row.get("cron") or "",
+        "tz": row.get("tz") or "UTC",
+        "only_when_available": bool(row.get("only_when_available", 1)),
+        "name": row.get("name"),
+        "compose_project": row.get("compose_project"),
+        "compose_service": row.get("compose_service"),
+        "last_run_at": row.get("last_run_at"),
+        "last_status": row.get("last_status"),
+        "last_message": row.get("last_message"),
+        "last_job_id": row.get("last_job_id"),
+        "updated_at": row.get("updated_at"),
+    }
+
+
+def list_container_auto_updates() -> list[dict[str, Any]]:
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM container_auto_updates ORDER BY name COLLATE NOCASE, watched_key COLLATE NOCASE"
+        ).fetchall()
+    return [_auto_update_row(dict(r)) for r in rows]
+
+
+def container_auto_updates_map() -> dict[str, dict[str, Any]]:
+    return {
+        row["watched_key"]: row
+        for row in list_container_auto_updates()
+        if row.get("watched_key")
+    }
+
+
+def get_container_auto_update(watched_key: str) -> dict[str, Any] | None:
+    with db() as conn:
+        row = conn.execute(
+            "SELECT * FROM container_auto_updates WHERE watched_key = ?",
+            (watched_key,),
+        ).fetchone()
+    return _auto_update_row(dict(row)) if row else None
+
+
+def upsert_container_auto_update(
+    watched_key: str,
+    *,
+    enabled: bool = False,
+    schedule_frequency: str | None = None,
+    schedule_weekday: str | None = None,
+    schedule_hour: int | None = None,
+    schedule_minute: int | None = None,
+    cron: str | None = None,
+    tz: str = "UTC",
+    only_when_available: bool = True,
+    name: str | None = None,
+    compose_project: str | None = None,
+    compose_service: str | None = None,
+) -> dict[str, Any]:
+    """Create or replace an auto-update policy for watched_key."""
+    now = _utc_now()
+    existing = get_container_auto_update(watched_key)
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO container_auto_updates (
+                watched_key, enabled, schedule_frequency, schedule_weekday,
+                schedule_hour, schedule_minute, cron, tz, only_when_available,
+                name, compose_project, compose_service,
+                last_run_at, last_status, last_message, last_job_id, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(watched_key) DO UPDATE SET
+                enabled = excluded.enabled,
+                schedule_frequency = excluded.schedule_frequency,
+                schedule_weekday = excluded.schedule_weekday,
+                schedule_hour = excluded.schedule_hour,
+                schedule_minute = excluded.schedule_minute,
+                cron = excluded.cron,
+                tz = excluded.tz,
+                only_when_available = excluded.only_when_available,
+                name = COALESCE(excluded.name, container_auto_updates.name),
+                compose_project = COALESCE(
+                    excluded.compose_project, container_auto_updates.compose_project
+                ),
+                compose_service = COALESCE(
+                    excluded.compose_service, container_auto_updates.compose_service
+                ),
+                updated_at = excluded.updated_at
+            """,
+            (
+                watched_key,
+                1 if enabled else 0,
+                schedule_frequency,
+                schedule_weekday,
+                schedule_hour,
+                schedule_minute,
+                (cron or "").strip() or None,
+                (tz or "UTC").strip() or "UTC",
+                1 if only_when_available else 0,
+                name,
+                compose_project,
+                compose_service,
+                existing.get("last_run_at") if existing else None,
+                existing.get("last_status") if existing else None,
+                existing.get("last_message") if existing else None,
+                existing.get("last_job_id") if existing else None,
+                now,
+            ),
+        )
+    row = get_container_auto_update(watched_key)
+    assert row is not None
+    return row
+
+
+def record_container_auto_update_run(
+    watched_key: str,
+    *,
+    status: str,
+    message: str | None = None,
+    job_id: str | None = None,
+) -> None:
+    with db() as conn:
+        conn.execute(
+            """
+            UPDATE container_auto_updates
+            SET last_run_at = ?,
+                last_status = ?,
+                last_message = ?,
+                last_job_id = COALESCE(?, last_job_id),
+                updated_at = ?
+            WHERE watched_key = ?
+            """,
+            (_utc_now(), status, message, job_id, _utc_now(), watched_key),
+        )
+
+
+def clear_container_auto_update(watched_key: str) -> None:
+    with db() as conn:
+        conn.execute(
+            "DELETE FROM container_auto_updates WHERE watched_key = ?",
+            (watched_key,),
         )
 
 
