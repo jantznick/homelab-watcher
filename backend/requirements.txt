@@ -8,6 +8,6 @@ apscheduler==3.10.4
 pyyaml==6.0.2
 psutil==6.1.1
 resend==2.6.0
-dnspython==2.7.0
+dnspython==2.9.0
 pydantic==2.10.4
 pydantic-settings==2.7.0
